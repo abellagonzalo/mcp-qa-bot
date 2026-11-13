@@ -89,7 +89,7 @@ def test_render_report(qa_dir):
     assert "6 entries)" in md
     assert "| T1 | Duplicate idempotency key is rejected | ❌ fail |" in md
     assert "👤 Manual entries during this test: #3 (`kubectl logs payments-7d9f`)" in md
-    assert "### E1 · 🤖 #2 · " in md and "· exit 0 · 312 ms" in md
+    assert "**E1** · 🤖 #2 · " in md and "· exit 0 · 312 ms" in md
     assert f"$ {POST}\n201\n" in md
     assert "· lines 1-3\n```\n$ psql -c 'select count(*) from transfers'\n count\n-------\n     2\n```" in md
     assert "## Timeline" not in md
@@ -203,7 +203,9 @@ def test_checks_render_as_numbered_expected_and_actual_lists(clean_dir):
     assert md.index(expected) < md.index(actual) < md.index("**Note:** n")
     assert "   ```\n" + f"   $ {POST}\n   201\n   ```\n" in md  # the failed check's proof, nested
     # E1 backs a passing check: it stays in the Evidence section; E2 is shown only inline
-    assert "**Evidence**\n\n" in md and "### E1 · 🤖 #1 · " in md and "### E2" not in md
+    section = md[md.index("**Evidence**\n\n"):]
+    assert "**E1** · 🤖 #1 · " in section and "**E2" not in section
+    assert md.count("**E2: POST returns 201**") == 1
 
 
 def test_evidence_shared_by_two_failed_checks_is_shown_once(clean_dir):
@@ -317,8 +319,8 @@ def test_evidence_titles_head_their_blocks(clean_dir):
     path, warnings = report.render_report(clean_dir, verdicts)
     md = path.read_text()
     assert warnings == []
-    assert "### E1: Context is staging\n🤖 #1 · " in md
-    assert "### E2: POST returns 201\n🤖 #2 · " in md
+    assert "**E1: Context is staging**  \n🤖 #1 · " in md
+    assert "**E2: POST returns 201**  \n🤖 #2 · " in md
     assert "](#t1-" not in md
 
 
@@ -351,7 +353,7 @@ def test_image_evidence(qa_dir, drawer):
     assert "![#4](evidence/T1-2.png)" in md
     assert "![#5 lines 1-3](evidence/T1-3.png)" in md
     assert f"$ {POST}\n201\n" not in md  # no text blocks in image mode
-    assert "### E1 · 🤖 #2 · " in md  # headings stay text
+    assert "**E1** · 🤖 #2 · " in md  # labels stay text
     assert "Images in evidence/ are rendered from the same lines" in md
     assert images(qa_dir) == ["T1-1.png", "T1-2.png", "T1-3.png"]
     assert sorted(p.name for p in qa_dir.iterdir() if p.name.startswith(".evidence")) == []
@@ -490,7 +492,7 @@ def test_render_from_an_in_memory_record():
         {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [1]}]}, rec
     )
     assert "Log: session.log (sha256 abab…abab, 2 entries)" in md
-    assert "### E1 · 🤖 #1 · " in md
+    assert "**E1** · 🤖 #1 · " in md
     assert warnings == [
         "Log anomaly: exec #7 `curl lost` typed at 09:05:01 has no markers in the log (missing).",
         "Manual entries no verdict cites: #2 (`ls`).",
@@ -592,7 +594,7 @@ def _poll_verdicts(evidence):
 
 
 POLL_BLOCK = [
-    "### E1 · 🤖 #2–#5 · " + report._time(1010.0) + " · polled 3× over 41 s until /PROCESSED/ (matched)",
+    "**E1** · 🤖 #2–#5 · " + report._time(1010.0) + " · polled 3× over 41 s until /PROCESSED/ (matched)",
     "```",
     f"$ {GET}",
     "[attempt 1 · " + report._time(1010.0) + "]",
@@ -608,7 +610,7 @@ def test_cited_poll_folds_into_one_block(poll_dir, evidence):
     path, warnings = report.render_report(poll_dir, _poll_verdicts(evidence))
     md = path.read_text()
     assert "\n".join(POLL_BLOCK) in md
-    assert md.count("### ") == 1
+    assert md.count('"></a>**E') == 1
     # the human's command between attempts is surfaced, as for any test
     assert "👤 Manual entries during this test: #4" in md
     assert warnings == ["Manual entries no verdict cites: #4 (`echo typed by human`)."]
@@ -617,13 +619,13 @@ def test_cited_poll_folds_into_one_block(poll_dir, evidence):
 def test_titled_poll_citation(poll_dir):
     path, _ = report.render_report(poll_dir, _poll_verdicts([{"poll": 1, "title": "Batch reaches PROCESSED"}]))
     md = path.read_text()
-    assert "### E1: Batch reaches PROCESSED\n" in md
+    assert "**E1: Batch reaches PROCESSED**  \n" in md
 
 
 def test_attempt_with_line_range_is_not_folded(poll_dir):
     path, _ = report.render_report(poll_dir, _poll_verdicts([{"entry": 3, "lines": "1"}]))
     md = path.read_text()
-    assert "polled" not in md and "### E1 · 🤖 #3 · " in md
+    assert "polled" not in md and "**E1** · 🤖 #3 · " in md
 
 
 def test_unknown_poll_is_warned(poll_dir):
@@ -643,7 +645,7 @@ def test_single_attempt_poll(tmp_path):
     d = make_dir(tmp_path, log, [{"id": 1, "command": GET, "poll_id": 1}],
                  [{"poll_id": 1, "command": GET, "until": "PROCESSED", "attempts": [1], "outcome": "matched"}])
     md = report.render_report(d, _poll_verdicts([1]))[0].read_text()
-    assert "### E1 · 🤖 #1 · " in md and "polled 1× over 0 s" in md and md.count("[attempt") == 1
+    assert "**E1** · 🤖 #1 · " in md and "polled 1× over 0 s" in md and md.count("[attempt") == 1
 
 
 def test_poll_index_is_covered_by_the_hash(poll_dir):

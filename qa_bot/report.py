@@ -1,6 +1,6 @@
 """Validate ``verdicts.json`` against the closed log and render ``qa-report.md``.
 
-Everything above the ``###`` evidence blocks comes from the verdicts the agent wrote;
+Everything above the evidence blocks comes from the verdicts the agent wrote;
 the evidence blocks are copied verbatim from the cleaned log entries, as text, as images
 drawn from the same lines (``evidence.py``), or both. The agent never writes evidence
 itself. A cited poll group (``poll`` tool) is one block showing its first and last
@@ -642,18 +642,14 @@ def _evidence_block(
 ) -> list[str]:
     """Evidence ``E<k>``: label, title and flags, then the cited lines as ``blocks`` renders them.
 
-    ``inline`` blocks sit under a failed check's list item, so they get a bold label
-    instead of a heading.
+    The label is bold, not a heading, so evidence stays out of the document outline.
+    ``inline`` blocks sit under a failed check's list item, so they get no trailing gap.
     """
     head, body = _evidence_body(c)
     meta = " · ".join(head)
     label = f"E{k}: {c.title}" if c.title else f"E{k}"
-    if inline:
-        first = f'<a id="{anchor}"></a>**{label}**'
-        out = [f"{first}  ", f"{meta}  "] if c.title else [f"{first} · {meta}  "]
-    else:
-        out = [f'<a id="{anchor}"></a>', ""]
-        out += [f"### {label}", f"{meta}  "] if c.title else [f"### {label} · {meta}"]
+    first = f'<a id="{anchor}"></a>**{label}**'
+    out = [f"{first}  ", meta] if c.title else [f"{first} · {meta}"]
     out += [f"> ⚠️ {flag}" for flag in _flags(c)]
     out += blocks.block(test_id, k, _alt(c), body)
     if not inline:
