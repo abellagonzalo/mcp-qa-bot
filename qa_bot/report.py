@@ -37,10 +37,46 @@ def max_uncited_lines() -> int:
         return 200
 
 
-@dataclass
+@dataclass(frozen=True)
 class Citation:
+    """Cites lines of an entry that is in the log."""
+
     entry: transcript.Entry
     lines: tuple[int, int] | None  # 1-based inclusive range, None = whole entry
+
+
+@dataclass(frozen=True)
+class MissingCitation:
+    """Cites an ``exec`` call that left no markers in the log (always warned about)."""
+
+    exec_id: int
+
+
+@dataclass
+class TestCase:
+    """One verdict, normalized: rendering reads only this, never the raw dict."""
+
+    id: str  # resolved once: the given id, or "test N"
+    goal: str
+    verdict: str  # lower-cased; may be invalid (warned about)
+    input: str
+    expected: str
+    actual: str
+    note: str
+    citations: list[Citation | MissingCitation]
+
+    @property
+    def evidence(self) -> list[Citation]:
+        return [c for c in self.citations if isinstance(c, Citation)]
+
+
+@dataclass
+class Verdicts:
+    ticket: str
+    env: str
+    build: str
+    tests: list[TestCase]
+    warnings: list[str]
 
 
 # ------------------------------------------------------------------- helpers
@@ -79,8 +115,8 @@ def _text(value) -> str:
 
 
 def _parse_citation(
-    item, t: transcript.Transcript, missing_ids: set, test_id: str, warnings: list[str]
-) -> Citation | None:
+    item, t: transcript.Transcript, missing_ids: set[int], test_id: str, warnings: list[str]
+) -> Citation | MissingCitation | None:
     by_id = t.by_id()
     if isinstance(item, bool):
         item = None
@@ -96,7 +132,8 @@ def _parse_citation(
     if entry is None:
         if eid in missing_ids:
             warnings.append(f"{test_id}: cites #{eid}, an exec call with no markers in the log (missing).")
-        elif any(s.id == str(eid) for s in t.stray):
+            return MissingCitation(eid)
+        if any(s.id == str(eid) for s in t.stray):
             warnings.append(f"{test_id}: cites #{eid}, which only exists as a forged/orphan marker.")
         else:
             warnings.append(f"{test_id}: cites #{eid}, which is not in the log.")
@@ -117,18 +154,24 @@ def _parse_citation(
     return Citation(entry, (start, end))
 
 
-def validate(verdicts: dict, t: transcript.Transcript, missing: list[dict]) -> tuple[list[dict], list[list[Citation]], list[str]]:
+def parse_verdicts(verdicts: dict, t: transcript.Transcript, missing: list[dict]) -> Verdicts:
+    """Parse the agent's verdicts once into a normalized model, collecting warnings.
+
+    Raises ``ReportError`` only when the shape is unusable (not an object, no test list).
+    """
     if not isinstance(verdicts, dict):
         raise ReportError("verdicts must be a JSON object.")
-    tests = verdicts.get("tests")
-    if not isinstance(tests, list):
+    raw_tests = verdicts.get("tests")
+    if not isinstance(raw_tests, list):
         raise ReportError("verdicts.tests must be a list.")
 
     warnings: list[str] = []
-    missing_ids = {rec.get("id") for rec in missing}
+    # Exec calls that never saw a start marker are indexed with "id": None; they can't be cited.
+    missing_ids = {rec["id"] for rec in missing if isinstance(rec.get("id"), int)}
     seen: set[str] = set()
-    citations: list[list[Citation]] = []
-    for n, test in enumerate(tests, 1):
+    tests: list[TestCase] = []
+    limit = max_uncited_lines()
+    for n, test in enumerate(raw_tests, 1):
         if not isinstance(test, dict):
             raise ReportError(f"verdicts.tests[{n - 1}] must be an object.")
         tid = _text(test.get("id")) or f"test {n}"
@@ -137,32 +180,51 @@ def validate(verdicts: dict, t: transcript.Transcript, missing: list[dict]) -> t
         if tid in seen:
             warnings.append(f"{tid}: duplicate test id.")
         seen.add(tid)
-        if not _text(test.get("goal")):
+        goal = _text(test.get("goal"))
+        if not goal:
             warnings.append(f"{tid}: missing 'goal'.")
         verdict = _text(test.get("verdict")).lower()
         if verdict not in VERDICT_ICONS:
             warnings.append(f"{tid}: verdict '{test.get('verdict')}' must be pass, fail or skipped.")
-        if verdict in ("pass", "fail") and not _text(test.get("expected")):
+        expected, actual = _text(test.get("expected")), _text(test.get("actual"))
+        if verdict in ("pass", "fail") and not expected:
             warnings.append(f"{tid}: missing 'expected'.")
-        if verdict == "fail" and not _text(test.get("actual")):
+        if verdict == "fail" and not actual:
             warnings.append(f"{tid}: a failed test needs 'actual'.")
 
-        evidence = test.get("evidence") or []
-        if not isinstance(evidence, list):
+        items = test.get("evidence")
+        if items is None:
+            items = []
+        elif not isinstance(items, list):
             warnings.append(f"{tid}: 'evidence' must be a list.")
-            evidence = []
-        cits = [c for item in evidence if (c := _parse_citation(item, t, missing_ids, tid, warnings))]
-        if not cits and verdict != "skipped":
+            items = []
+        cits = [c for item in items if (c := _parse_citation(item, t, missing_ids, tid, warnings))]
+        case = TestCase(
+            id=tid,
+            goal=goal,
+            verdict=verdict,
+            input=_text(test.get("input")),
+            expected=expected,
+            actual=actual,
+            note=_text(test.get("note")),
+            citations=cits,
+        )
+        if not case.evidence and verdict != "skipped":
             warnings.append(f"{tid}: cites no log entries.")
-        limit = max_uncited_lines()
-        for c in cits:
+        for c in case.evidence:
             if c.lines is None and len(c.entry.lines) > limit:
                 warnings.append(
                     f"{tid}: #{c.entry.id} has {len(c.entry.lines)} lines; cited whole it is cut at "
                     f"{limit} lines. Cite a line range instead."
                 )
-        citations.append(cits)
-    return tests, citations, warnings
+        tests.append(case)
+    return Verdicts(
+        ticket=_text(verdicts.get("ticket")),
+        env=_text(verdicts.get("env")),
+        build=_text(verdicts.get("build")),
+        tests=tests,
+        warnings=warnings,
+    )
 
 
 # ----------------------------------------------------------------- rendering
@@ -232,37 +294,29 @@ def render(
     images = mode in ("image", "both")
     if images and directory is None:
         raise ReportError("image evidence needs the session folder.")
-    tests, citations, warnings = validate(verdicts, t, missing)
+    model = parse_verdicts(verdicts, t, missing)
+    warnings = model.warnings
     if images:
         img_limit = evidence.max_image_lines()
-        for test, cits in zip(tests, citations):
-            tid = _text(test.get("id")) or "?"
-            for c in cits:
+        for test in model.tests:
+            for c in test.evidence:
                 shown = _evidence_body(c)[2]
                 if shown > img_limit:
                     warnings.append(
-                        f"{tid}: #{c.entry.id} shows {shown} lines; an image over {img_limit} lines "
+                        f"{test.id}: #{c.entry.id} shows {shown} lines; an image over {img_limit} lines "
                         "is hard to read. Cite a narrower line range."
                     )
 
     cited_by: dict[int, list[str]] = {}
-    for test, cits in zip(tests, citations):
-        tid = _text(test.get("id")) or "?"
-        for c in cits:
-            if tid not in cited_by.setdefault(c.entry.id, []):
-                cited_by[c.entry.id].append(tid)
     missing_cited: dict[int, list[str]] = {}
-    for test in tests:
-        for item in test.get("evidence") or []:
-            eid = item.get("entry") if isinstance(item, dict) else item
-            if any(rec.get("id") == eid for rec in missing):
-                missing_cited.setdefault(eid, []).append(_text(test.get("id")))
+    for test in model.tests:
+        for c in test.citations:
+            key, table = (c.entry.id, cited_by) if isinstance(c, Citation) else (c.exec_id, missing_cited)
+            if test.id not in table.setdefault(key, []):
+                table[key].append(test.id)
 
-    title = _text(verdicts.get("ticket")) or "QA session"
-    meta = []
-    for key, label in (("env", "Env"), ("build", "Build")):
-        if _text(verdicts.get(key)):
-            meta.append(f"{label}: {_text(verdicts.get(key))}")
+    title = model.ticket or "QA session"
+    meta = [f"{label}: {value}" for label, value in (("Env", model.env), ("Build", model.build)) if value]
     meta.append(f"Log: {sess.LOG_NAME} (sha256 {_short_hash(log_hash)}, {len(t.entries)} entries)")
 
     out: list[str] = [f"# QA report: {title}", " · ".join(meta), ""]
@@ -273,27 +327,25 @@ def render(
         out.append("")
 
     out += ["| Test | Goal | Verdict |", "|---|---|---|"]
-    for test in tests:
-        verdict = _text(test.get("verdict")).lower()
-        goal = _text(test.get("goal")).replace("|", "\\|")
-        icon = VERDICT_ICONS.get(verdict, "❔ " + verdict)
-        out.append(f"| {_text(test.get('id'))} | {goal} | {icon} |")
+    for test in model.tests:
+        icon = VERDICT_ICONS.get(test.verdict, "❔ " + test.verdict)
+        goal = test.goal.replace("|", "\\|")
+        out.append(f"| {test.id} | {goal} | {icon} |")
     out.append("")
 
     image_dir = evidence.reset_dir(directory) if images else None
     used_names: set[str] = set()
-    for test, cits in zip(tests, citations):
-        tid = _text(test.get("id"))
-        verdict = _text(test.get("verdict")).lower()
-        out.append(f"## {tid}: {_text(test.get('goal'))}")
+    for test in model.tests:
+        cits = test.evidence
+        out.append(f"## {test.id}: {test.goal}")
         fields = [
-            ("Input", test.get("input")),
-            ("Expected", test.get("expected")),
-            ("Actual", test.get("actual")),
-            ("Verdict", VERDICT_ICONS.get(verdict, "❔ " + verdict)),
-            ("Note", test.get("note")),
+            ("Input", test.input),
+            ("Expected", test.expected),
+            ("Actual", test.actual),
+            ("Verdict", VERDICT_ICONS.get(test.verdict, "❔ " + test.verdict)),
+            ("Note", test.note),
         ]
-        out += [f"**{label}:** {_text(value)}  " for label, value in fields if _text(value)]
+        out += [f"**{label}:** {value}  " for label, value in fields if value]
         if cits:
             ids = [c.entry.id for c in cits]
             cited = set(ids)
@@ -309,10 +361,10 @@ def render(
             image = None
             if images:
                 # Duplicate test ids (already warned about) must not overwrite each other's images.
-                name, n = evidence.file_name(tid, k), 1
+                name, n = evidence.file_name(test.id, k), 1
                 while name in used_names:
                     n += 1
-                    name = evidence.file_name(f"{tid}_{n}", k)
+                    name = evidence.file_name(f"{test.id}_{n}", k)
                 used_names.add(name)
                 image = image_dir / name
             out += _evidence_block(c, mode, image)
