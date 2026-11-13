@@ -337,21 +337,37 @@ for long output.
     "id": "T1",
     "goal": "Duplicate idempotency key is rejected",
     "input": "`POST /v1/transfers` with `inputs/t1.json` twice, key `qa-pay123-t1`",
-    "expected": "1st POST `201`, 2nd POST `409`, one row in `transfers`",
     "verdict": "fail",
-    "actual": "2nd POST returned `201`; two rows created",
+    "checks": [
+      {"check": "1st POST", "expected": "`201`", "actual": "`201`", "ok": true},
+      {"check": "2nd POST, same key", "expected": "`409`", "actual": "`201`", "ok": false},
+      {"check": "Rows in `transfers`", "expected": "1", "actual": "2", "ok": false}
+    ],
     "evidence": [
       {"entry": 2, "title": "1st POST is accepted with 201"},
       {"entry": 4, "lines": "1-3", "title": "2nd POST with the same key also returns 201"},
       {"entry": 5, "title": "transfers has two rows for the key"}
     ],
     "note": "`IdempotencyFilter` is not registered on `/v1/transfers` (`TransferController.kt:42`)"
-  }]
+  }],
+  "findings": [
+    "Duplicate transfers are accepted: the idempotency key is ignored on `/v1/transfers`"
+  ]
 }
 ```
 
-- `input`, `expected`, `actual` and `note` are inline markdown, rendered as written.
-  Put endpoints, payloads, keys, ids, statuses, field values and timestamps in
+- Each test lists what it verified as `checks`, one per observable fact (status code,
+  each field, DB row, log line): `check` names it, `expected` and `actual` are the
+  values, `ok` is `true` or `false`. The report shows them as a table, so a reader sees
+  at once which fact broke. A `pass` has every check `ok`; a `fail` has at least one
+  that isn't. Free-text `expected`/`actual` still work for a test that isn't a list of
+  facts.
+- `note` is one or two sentences of context for this test (why a retry, a deviation
+  from the plan). Anything a reader should act on even though the test passed, such as
+  a surprising behaviour, a risk or a gap in the ticket, goes in the top-level
+  `findings` list instead, one sentence each; the report shows it near the top.
+- `input`, `expected`, `actual`, `note`, check cells and findings are inline markdown,
+  rendered as written. Put endpoints, payloads, keys, ids, statuses, field values and timestamps in
   backticks (`POST /api/v1/batches/275/cancel`, `{"cancelledBy":"qa"}`,
   `status=CANCELLED`); use **bold** sparingly for the deciding fact. Keep each on one
   line: no lists, headings or code fences.

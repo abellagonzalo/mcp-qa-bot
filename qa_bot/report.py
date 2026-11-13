@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -72,6 +72,16 @@ class MissingCitation:
     exec_id: int
 
 
+@dataclass(frozen=True)
+class Check:
+    """One row of a test's checks table: what was checked, expected vs actual, and whether it held."""
+
+    check: str
+    expected: str
+    actual: str
+    ok: bool | None  # None: not judged (skipped test, or warned about)
+
+
 @dataclass
 class TestCase:
     """One verdict, normalized: rendering reads only this, never the raw dict."""
@@ -84,6 +94,7 @@ class TestCase:
     actual: str
     note: str
     citations: list[Citation | PollCitation | MissingCitation]
+    checks: list[Check] = field(default_factory=list)
 
     @property
     def evidence(self) -> list[Citation | PollCitation]:
@@ -101,6 +112,7 @@ class Verdicts:
     build: str
     tests: list[TestCase]
     warnings: list[str]
+    findings: list[str] = field(default_factory=list)
 
 
 # ------------------------------------------------------------------- helpers
@@ -221,6 +233,54 @@ def _resolve_citation(
     return Citation(entry, (start, end))
 
 
+def _parse_checks(raw, tid: str, verdict: str, warnings: list[str]) -> list[Check]:
+    """The optional ``checks`` list: ``[{"check", "expected", "actual", "ok"}]``."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        warnings.append(f"{tid}: 'checks' must be a list.")
+        return []
+    checks: list[Check] = []
+    for n, item in enumerate(raw, 1):
+        if not isinstance(item, dict):
+            warnings.append(f"{tid}: check {n} must be an object with check, expected, actual, ok.")
+            continue
+        name = _text(item.get("check")) or f"check {n}"
+        if not _text(item.get("check")):
+            warnings.append(f"{tid}: check {n} is missing 'check' (what is checked).")
+        expected, actual, ok = _text(item.get("expected")), _text(item.get("actual")), item.get("ok")
+        if not expected:
+            warnings.append(f"{tid}: check '{name}' is missing 'expected'.")
+        if verdict in ("pass", "fail"):
+            if not actual:
+                warnings.append(f"{tid}: check '{name}' is missing 'actual'.")
+            if not isinstance(ok, bool):
+                warnings.append(f"{tid}: check '{name}' needs 'ok': true or false.")
+        checks.append(Check(name, expected, actual, ok if isinstance(ok, bool) else None))
+    judged = [c.ok for c in checks if c.ok is not None]
+    if verdict == "pass" and False in judged:
+        warnings.append(f"{tid}: verdict is pass but a check failed.")
+    if verdict == "fail" and judged and all(judged):
+        warnings.append(f"{tid}: verdict is fail but every check passed.")
+    return checks
+
+
+def _parse_findings(raw, warnings: list[str]) -> list[str]:
+    """The optional top-level ``findings``: one-line inline-markdown strings."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        warnings.append("'findings' must be a list of strings.")
+        return []
+    out = []
+    for n, item in enumerate(raw, 1):
+        if not isinstance(item, str) or not item.strip():
+            warnings.append(f"finding {n} must be a non-empty string.")
+            continue
+        out.append(" ".join(item.split()))
+    return out
+
+
 def parse_verdicts(verdicts: dict, rec: Record) -> Verdicts:
     """Parse the agent's verdicts once into a normalized model, collecting warnings.
 
@@ -254,10 +314,11 @@ def parse_verdicts(verdicts: dict, rec: Record) -> Verdicts:
         if verdict not in VERDICT_ICONS:
             warnings.append(f"{tid}: verdict '{test.get('verdict')}' must be pass, fail or skipped.")
         expected, actual = _text(test.get("expected")), _text(test.get("actual"))
-        if verdict in ("pass", "fail") and not expected:
-            warnings.append(f"{tid}: missing 'expected'.")
-        if verdict == "fail" and not actual:
-            warnings.append(f"{tid}: a failed test needs 'actual'.")
+        checks = _parse_checks(test.get("checks"), tid, verdict, warnings)
+        if verdict in ("pass", "fail") and not expected and not checks:
+            warnings.append(f"{tid}: missing 'expected' (or 'checks').")
+        if verdict == "fail" and not actual and not checks:
+            warnings.append(f"{tid}: a failed test needs 'actual' (or 'checks').")
 
         items = test.get("evidence")
         if items is None:
@@ -284,6 +345,7 @@ def parse_verdicts(verdicts: dict, rec: Record) -> Verdicts:
             actual=actual,
             note=_text(test.get("note")),
             citations=cits,
+            checks=checks,
         )
         if not case.evidence and verdict != "skipped":
             warnings.append(f"{tid}: cites no log entries.")
@@ -304,6 +366,7 @@ def parse_verdicts(verdicts: dict, rec: Record) -> Verdicts:
         build=_text(verdicts.get("build")),
         tests=tests,
         warnings=warnings,
+        findings=_parse_findings(verdicts.get("findings"), warnings),
     )
 
 
@@ -436,6 +499,22 @@ def _link_text(text: str) -> str:
     return re.sub(r"([\\`*_\[\]<>|~])", r"\\\1", text)
 
 
+CHECK_ICONS = {True: "✅", False: "❌", None: "—"}
+
+
+def _cell(text: str) -> str:
+    return " ".join(text.split()).replace("|", "\\|") or "—"
+
+
+def _checks_table(checks: list[Check]) -> list[str]:
+    out = ["| Check | Expected | Actual | |", "|---|---|---|---|"]
+    out += [
+        f"| {_cell(c.check)} | {_cell(c.expected)} | {_cell(c.actual)} | {CHECK_ICONS[c.ok]} |"
+        for c in checks
+    ]
+    return out
+
+
 def _contents(tests, anchors: _Anchors) -> list[str]:
     out = ["## Contents", ""]
     for i, test in enumerate(tests):
@@ -474,15 +553,14 @@ def render(
     for i, test in enumerate(model.tests):
         cits = test.evidence
         a = anchors.test(i, test.id)
-        sections += [f'<a id="{a}"></a>', "", f"## {test.id}: {test.goal}"]
-        fields = [
-            ("Input", test.input),
-            ("Expected", test.expected),
-            ("Actual", test.actual),
-            ("Verdict", VERDICT_ICONS.get(test.verdict, "❔ " + test.verdict)),
-            ("Note", test.note),
-        ]
+        icon = VERDICT_ICONS.get(test.verdict, "❔ " + test.verdict)
+        sections += [f'<a id="{a}"></a>', "", f"## {test.id}: {test.goal} — {icon}"]
+        fields = [("Input", test.input), ("Expected", test.expected), ("Actual", test.actual)]
         sections += [f"**{label}:** {value}  " for label, value in fields if value]
+        if test.checks:
+            sections += ["", *_checks_table(test.checks), ""]
+        if test.note:
+            sections.append(f"**Note:** {test.note}  ")
         if cits:
             cited = test.cited_ids
             ids = sorted(cited)
@@ -516,6 +594,8 @@ def render(
         goal = test.goal.replace("|", "\\|")
         out.append(f"| {test.id} | {goal} | {icon} |")
     out.append("")
+    if model.findings:
+        out += ["## Findings", "", *(f"- ⚠️ {f}" for f in model.findings), ""]
     if model.tests:
         out += _contents(model.tests, anchors)
     out += sections

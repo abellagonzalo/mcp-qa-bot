@@ -112,7 +112,7 @@ def test_validation_warnings(qa_dir):
     assert "T1: cites #42, which is not in the log." in text
     assert "T1: #2 line range 1-9 is outside the entry (1-1)." in text
     assert "T2: cites no log entries." in text
-    assert "T2: a failed test needs 'actual'." in text
+    assert "T2: a failed test needs 'actual' (or 'checks')." in text
     assert "T3" not in text
     assert "T4: verdict 'maybe'" in text
     assert "T4: cites #99, which only exists as a forged/orphan marker." in text
@@ -170,6 +170,83 @@ def test_contents_links_each_test_one_level_only(clean_dir):
     assert contents == ["- [T1: g](#t1) ✅ pass"]
     assert '<a id="t1"></a>' in md
     assert md.index("## Contents") < md.index("## T1: g")
+
+
+def test_verdict_is_in_the_test_heading(clean_dir):
+    md = report.render_report(clean_dir, CLEAN_VERDICTS)[0].read_text()
+    assert "## T1: g — ✅ pass\n" in md
+    assert "**Verdict:**" not in md
+
+
+CHECKS = [
+    {"check": "HTTP status", "expected": "`200`", "actual": "`200`", "ok": True},
+    {"check": "`status`", "expected": "`CANCELLED`", "actual": "`VALIDATED`", "ok": False},
+]
+
+
+def test_checks_render_as_a_table(clean_dir):
+    verdicts = {"tests": [{"id": "T1", "goal": "g", "verdict": "fail", "checks": CHECKS,
+                           "note": "n", "evidence": [1]}]}
+    path, warnings = report.render_report(clean_dir, verdicts)
+    md = path.read_text()
+    assert warnings == []
+    table = (
+        "| Check | Expected | Actual | |\n|---|---|---|---|\n"
+        "| HTTP status | `200` | `200` | ✅ |\n"
+        "| `status` | `CANCELLED` | `VALIDATED` | ❌ |\n"
+    )
+    assert table in md
+    assert md.index(table) < md.index("**Note:** n")
+
+
+def test_checks_pipes_are_escaped(clean_dir):
+    checks = [{"check": "a|b", "expected": "x", "actual": "y\nz", "ok": True}]
+    verdicts = {"tests": [{"id": "T1", "goal": "g", "verdict": "pass", "checks": checks, "evidence": [1]}]}
+    md = report.render_report(clean_dir, verdicts)[0].read_text()
+    assert "| a\\|b | x | y z | ✅ |" in md
+
+
+@pytest.mark.parametrize("verdict, checks, warning", [
+    ("pass", CHECKS, "T1: verdict is pass but a check failed."),
+    ("fail", CHECKS[:1], "T1: verdict is fail but every check passed."),
+    ("pass", [{"check": "c", "expected": "e", "actual": "a"}], "T1: check 'c' needs 'ok': true or false."),
+    ("pass", [{"check": "c", "expected": "e", "ok": True}], "T1: check 'c' is missing 'actual'."),
+    ("pass", [{"expected": "e", "actual": "a", "ok": True}], "T1: check 1 is missing 'check' (what is checked)."),
+    ("pass", "nope", "T1: 'checks' must be a list."),
+])
+def test_checks_are_validated(clean_dir, verdict, checks, warning):
+    verdicts = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": verdict,
+                           "checks": checks, "evidence": [1]}]}
+    _, warnings = report.render_report(clean_dir, verdicts)
+    assert warning in warnings
+
+
+def test_skipped_test_checks_need_no_actual(clean_dir):
+    checks = [{"check": "c", "expected": "e"}]
+    verdicts = {"tests": [{"id": "T1", "goal": "g", "verdict": "skipped", "checks": checks, "note": "n"}]}
+    path, warnings = report.render_report(clean_dir, verdicts)
+    assert warnings == []
+    assert "| c | e | — | — |" in path.read_text()
+
+
+def test_findings_section_comes_before_contents(clean_dir):
+    verdicts = dict(CLEAN_VERDICTS, findings=["Reusing a key on another batch returns `204`", "  two\n lines "])
+    path, warnings = report.render_report(clean_dir, verdicts)
+    md = path.read_text()
+    assert warnings == []
+    assert "## Findings\n\n- ⚠️ Reusing a key on another batch returns `204`\n- ⚠️ two lines\n" in md
+    assert md.index("## Findings") < md.index("## Contents")
+
+
+def test_no_findings_no_section(clean_dir):
+    assert "## Findings" not in report.render_report(clean_dir, CLEAN_VERDICTS)[0].read_text()
+
+
+def test_bad_findings_are_warned(clean_dir):
+    _, warnings = report.render_report(clean_dir, dict(CLEAN_VERDICTS, findings="x"))
+    assert "'findings' must be a list of strings." in warnings
+    _, warnings = report.render_report(clean_dir, dict(CLEAN_VERDICTS, findings=["ok", 3]))
+    assert "finding 2 must be a non-empty string." in warnings
 
 
 def test_evidence_titles_head_their_blocks(clean_dir):

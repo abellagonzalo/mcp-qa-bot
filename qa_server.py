@@ -280,14 +280,18 @@ async def render_report(
     Args:
         verdicts: The verdicts object. If given it is written to <dir>/verdicts.json;
             otherwise <dir>/verdicts.json is read. Shape:
-            {"ticket", "env", "build", "tests": [{"id", "goal", "input", "expected",
-            "verdict": "pass|fail|skipped", "actual", "note",
+            {"ticket", "env", "build", "findings": ["…"], "tests": [{"id", "goal", "input",
+            "verdict": "pass|fail|skipped", "checks": [{"check", "expected", "actual",
+            "ok": true}], "expected", "actual", "note",
             "evidence": [{"entry": 2, "title": "…"}, {"entry": 4, "lines": "1-3", "title": "…"},
             {"poll": 1, "title": "…"}]}]}
             Each evidence title says in plain words what the block shows (not the
             command); it heads the block in the report.
-            input, expected, actual and note are one-line inline markdown: put
-            endpoints, payloads, keys, ids, statuses and values in `backticks`.
+            checks render as a table, one row per observable fact; a pass has every
+            check ok. findings are report-level, one sentence each: things to act on
+            even when tests pass. input, expected, actual, note, check cells and
+            findings are one-line inline markdown: put endpoints, payloads, keys, ids,
+            statuses and values in `backticks`.
             An entry id that belongs to a poll group (or {"poll": n}) shows the whole
             group as one block: first and last attempt. Cite {"entry": id, "lines": ...}
             to show just that attempt.
