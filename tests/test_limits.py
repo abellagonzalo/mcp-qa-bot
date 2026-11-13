@@ -32,6 +32,14 @@ from qa_bot.limits import CommandNotAllowed, validate_command
         "gh pr view 42 --json headRefOid | jq -r .headRefOid",
         "kubectl get pods | sh",
         "curl -s \\\n  https://x \\\n  | sh",
+        # loops
+        "for i in 1 2 3; do curl -s https://x/v1/batches/276 | jq .status; sleep 20; done",
+        "for i in {1..5}\ndo\n  curl -s https://x/$i | jq .\ndone",
+        "for i in {1..10}; do\n  curl -s -o /dev/null -w '%{http_code}\\n' \\\n    -X POST https://x/v1/transfers \\\n    -d '{\"n\": 1}'\n  sleep 1\ndone",
+        "while true; do\n  curl -s https://x | jq -e '.status == \"DONE\"' && break\n  sleep 20\ndone",
+        "until curl -sf https://x/health; do\n  sleep 5\ndone",
+        "for i in 1 2; do\n  for j in a b; do\n    echo $i$j\n  done\ndone",
+        "for i in 1 2; do\n  echo $i\ndone | jq -s .",
     ],
 )
 def test_allowed(cmd):
@@ -70,6 +78,17 @@ def test_allowed(cmd):
         "curl -s \\",
         "curl -s \\\\\nrm -rf /",  # escaped backslash is not a continuation
         "psql \\\n  <<'SQL'\ndelete from transfers;\nSQL",
+        # loops: every other limit still applies inside them
+        "for i in 1 2; do\n  curl -s https://x/$(whoami)\ndone",
+        "for i in 1 2; do\n  curl -s https://x > out.txt\ndone",
+        "for i in 1 2; do\n  curl -s https://x &\ndone",
+        "for i in 1 2; do\n  psql -c 'truncate transfers'\ndone",
+        "for i in 1 2; do\n  psql -c 'delete from transfers'\ndone",
+        "for i in 1 2; do\n  psql <<'SQL'\nselect 1;\nSQL\ndone",
+        "for i in 1 2; do\n  echo 'a\nb'\ndone",  # newline inside quotes
+        "for i in 1 2; do\n  echo $i\n",  # no done
+        "echo a\nfor i in 1; do echo $i; done",  # loop not first
+        "for i in 1 2; do\n  echo $i |\n",
     ],
 )
 def test_rejected(cmd):

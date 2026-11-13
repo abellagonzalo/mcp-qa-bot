@@ -1,6 +1,6 @@
 ---
 name: manual-qa
-description: Manually test a change on dev or staging the way a person would — real endpoints, real database, real logs — with a recorded terminal session and a rendered QA report as proof. Use when the user asks to QA, manually test, or verify a ticket/PR on dev or staging. Requires the qa-bot MCP server (open_session, exec, peek, interrupt, close_session, render_report).
+description: Manually test a change on dev or staging the way a person would — real endpoints, real database, real logs — with a recorded terminal session and a rendered QA report as proof. Use when the user asks to QA, manually test, or verify a ticket/PR on dev or staging. Requires the qa-bot MCP server (open_session, exec, poll, peek, interrupt, close_session, render_report).
 ---
 
 # Manual QA
@@ -146,8 +146,41 @@ For each test, write:
    where idempotency_key = 'qa-pay123-t1-20261112';
   SQL
   ```
-- Anything else multi-line (a newline inside quotes, two heredocs) is refused by
-  `exec`. Only ` \` continuations and one heredoc are allowed.
+- **Loops** (`for`/`while`/`until … done`) are allowed, on one line or over several.
+  Loop variables (`$i`) are control flow, not values, so the literal-values rule
+  doesn't cover them. Every other limit still applies inside the loop.
+- Anything else multi-line (a newline inside quotes, two heredocs, a heredoc inside a
+  loop) is refused by `exec`. Only ` \` continuations, one heredoc and loops are
+  allowed.
+
+### Async behaviour: `poll` or a loop
+
+When you design a test, choose how to wait or repeat:
+
+- **`poll`** when the test waits for a state: a scheduler job, a listener, delayed
+  processing. `poll(command, until, interval=20, max_attempts=10)` runs a read
+  command until its output matches the `until` regex. Each attempt is a recorded
+  entry, the group gets an id (`P1`), and the report shows the group as one block
+  (first and last attempt). Size `interval × max_attempts` to the longest wait you'd
+  accept, and write it in the plan as the expected outcome ("PROCESSED within 3 min").
+
+  ```text
+  poll(command="curl -s https://api.staging.example.com/v1/batches/276 | jq '{id, status}'",
+       until='"status": "PROCESSED"', interval=20, max_attempts=9)
+  ```
+- **A loop in `exec`** when the iteration itself is the test, e.g. submit N requests
+  and check where a rate limit kicks in. A loop is one entry.
+
+  ```bash
+  for i in {1..12}; do
+    curl -s -o /dev/null -w '%{http_code}\n' \
+      -H "Authorization: Bearer $TOKEN" \
+      https://api.staging.example.com/v1/quotes
+  done
+  ```
+
+The choice is yours; say which one each test uses in the plan. A `poll` or loop that
+runs a dangerous command goes through the danger review with its repeat count.
 - Created entities get **unique ids / idempotency keys** (e.g. `qa-pay123-t1-<date>`)
   so reruns don't collide.
 
@@ -268,13 +301,16 @@ approval again. The user's own commands in the pane need no approval.
    the deployed build again. Don't start testing until it matches the target.
 3. Run each approved command with `exec`. Note the entry id (`#N`) of every result;
    verdicts cite them. Line numbers in `exec` output are the ones you cite.
-4. If `exec` returns:
+4. If `exec` (or `poll`) returns:
    - **BUSY**: the user is typing or a command is running. Don't type over them. Wait,
      `peek`, or ask.
    - **TIMEOUT**: `peek` to see progress; `interrupt` if it hangs. Never retry a
      dangerous command blindly.
    - A refusal (hard limit, production, forbidden SQL): don't try to get around it.
      Report it and adjust the plan with the user.
+   - From `poll`: **exhausted** means the state wasn't reached in time, which is a
+     result: judge it, don't extend the poll on your own. **busy**, **timeout** or
+     **interrupted** stopped the poll early: find out why before polling again.
 5. If the user runs commands in the pane, they are recorded as manual entries. You may
    cite them.
 6. `close_session(keep_tmux=true)` when done, so the user can still scroll the pane
@@ -305,6 +341,8 @@ for long output.
 ```
 
 - `evidence` items are an entry id (whole entry) or `{"entry": id, "lines": "a-b"}`.
+  For a poll, cite `{"poll": 1}` or any attempt's entry id: the report shows the group
+  as one block. Cite `{"entry": id, "lines": "a-b"}` to show only that attempt.
 - A failure states actual vs expected. It may point to a bug in the code or in the
   ticket; say which you think it is in `note`.
 - Judge from the text output `exec` returns.

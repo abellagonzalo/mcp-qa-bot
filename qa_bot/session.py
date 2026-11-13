@@ -8,8 +8,10 @@ Mechanics:
 - ``exec`` pastes the command into the pane (bracketed paste, so ``;`` and heredocs
   arrive exactly as written), presses Enter and waits on ``tmux wait-for`` until the
   hooks report that this command finished.
-- ``close`` stops ``pipe-pane`` and writes ``session.index.json`` and
-  ``session.log.sha256``.
+- ``poll`` runs ``exec`` once per attempt until the output matches a regex; every
+  attempt is a normal entry, and the attempts are recorded as one poll group.
+- ``close`` stops ``pipe-pane`` and writes ``session.index.json`` (exec records and
+  poll groups) and ``session.log.sha256``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from . import transcript
 
@@ -124,12 +127,28 @@ class ExecResult:
 
 
 @dataclass
+class PollResult:
+    poll_id: int
+    outcome: str  # matched | exhausted | busy | timeout | interrupted
+    attempts: list[ExecResult]  # attempts that ran (BUSY ones are not included)
+    elapsed_s: float
+
+    @property
+    def entry_ids(self) -> list[int]:
+        return [a.entry_id for a in self.attempts if a.entry_id is not None]
+
+
+INTERRUPTED_EXIT_CODES = {130}  # Ctrl-C
+
+
+@dataclass
 class Session:
     name: str
     dir: Path
     runtime: Path
     channel: str
     index: list[dict] = field(default_factory=list)
+    polls: list[dict] = field(default_factory=list)
     closed: bool = False
 
     # ---------------------------------------------------------------- paths
@@ -197,7 +216,7 @@ class Session:
             raise SessionError("Session already closed.")
         tmux("pipe-pane", "-t", self.target, check=False)  # no command = stop piping
         _wait_stable(self.log_path)
-        (self.dir / INDEX_NAME).write_text(json.dumps({"session": self.name, "execs": self.index}, indent=2) + "\n")
+        (self.dir / INDEX_NAME).write_text(json.dumps({"session": self.name, "execs": self.index, "polls": self.polls}, indent=2) + "\n")
         log_hash = write_hash_file(self.dir)
         self.closed = True
         if kill:
@@ -242,7 +261,7 @@ class Session:
         tmux("paste-buffer", "-b", self.channel, "-d", "-p", "-t", self.target)
         tmux("send-keys", "-t", self.target, "Enter")
 
-    def exec(self, command: str, timeout: float) -> ExecResult:
+    def exec(self, command: str, timeout: float, poll_id: int | None = None) -> ExecResult:
         if self.closed:
             raise SessionError("Session is closed.")
         state = self.state()
@@ -252,6 +271,8 @@ class Session:
         offset = self.log_path.stat().st_size
         typed_at = datetime.now().astimezone()
         record = {"id": None, "command": command, "typed_at": typed_at.isoformat(timespec="milliseconds")}
+        if poll_id is not None:
+            record["poll_id"] = poll_id
         self.index.append(record)
         self._type_line(command)
 
@@ -288,6 +309,61 @@ class Session:
             duration_ms=entry.duration_ms,
             output=entry.lines,
         )
+
+    def poll(
+        self,
+        command: str,
+        until: str,
+        interval: float,
+        max_attempts: int,
+        timeout: float,
+        before_attempt: Callable[[], None] = lambda: None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> PollResult:
+        """Run ``command`` up to ``max_attempts`` times, ``interval`` seconds apart, until
+        its output matches the ``until`` regex.
+
+        Each attempt goes through ``exec`` (one recorded entry each) after
+        ``before_attempt`` (the caller's per-attempt safety check, which may raise).
+        Stops early when the pane is busy, an attempt times out or is interrupted
+        (Ctrl-C). The group is recorded in the index whatever the outcome.
+        """
+        pattern = re.compile(until, re.M)
+        group = {
+            "poll_id": len(self.polls) + 1,
+            "command": command,
+            "until": until,
+            "interval": interval,
+            "max_attempts": max_attempts,
+            "attempts": [],
+            "outcome": "error",  # overwritten unless an exception escapes
+        }
+        self.polls.append(group)
+        attempts: list[ExecResult] = []
+        started = time.monotonic()
+        outcome = "exhausted"
+        for n in range(max_attempts):
+            if n:
+                sleep(interval)
+            before_attempt()
+            result = self.exec(command, timeout, poll_id=group["poll_id"])
+            if result.status == "BUSY":
+                outcome = "busy"
+                break
+            attempts.append(result)
+            if result.entry_id is not None:
+                group["attempts"].append(result.entry_id)
+            if result.status == "TIMEOUT":
+                outcome = "timeout"
+                break
+            if result.exit_code in INTERRUPTED_EXIT_CODES:
+                outcome = "interrupted"
+                break
+            if pattern.search("\n".join(result.output)):
+                outcome = "matched"
+                break
+        group["outcome"] = outcome
+        return PollResult(group["poll_id"], outcome, attempts, time.monotonic() - started)
 
     def _find_entry(self, offset: int) -> transcript.Entry | None:
         """First top-level entry that started after ``offset`` in the log."""

@@ -7,9 +7,12 @@ from logfake import end, entry, start
 from qa_bot import evidence, report, session
 
 
-def make_dir(tmp_path, log: bytes, execs: list[dict]):
+def make_dir(tmp_path, log: bytes, execs: list[dict], polls: list[dict] | None = None):
     (tmp_path / session.LOG_NAME).write_bytes(log)
-    (tmp_path / session.INDEX_NAME).write_text(json.dumps({"session": "t", "execs": execs}))
+    doc = {"session": "t", "execs": execs}
+    if polls is not None:
+        doc["polls"] = polls
+    (tmp_path / session.INDEX_NAME).write_text(json.dumps(doc))
     session.write_hash_file(tmp_path)
     return tmp_path
 
@@ -268,7 +271,9 @@ def test_rejected_item_is_not_treated_as_a_markerless_exec(qa_dir):
     bad = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [{"lines": "1"}, 2]}]}
     model = _model(qa_dir, bad)
     assert [c.entry.id for c in model.tests[0].citations] == [2]
-    assert model.warnings == ['T1: evidence item {"lines": "1"} is not an entry id or {"entry": id, "lines": "a-b"}.']
+    assert model.warnings == [
+        'T1: evidence item {"lines": "1"} is not an entry id, {"entry": id, "lines": "a-b"} or {"poll": n}.'
+    ]
 
 
 def test_cited_missing_exec(tmp_path):
@@ -303,3 +308,87 @@ def test_uncited_flagged_entry_warns(tmp_path):
     v = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [1]}]}
     _, warnings = report.render_report(d, v)
     assert warnings == ["Log anomaly: #2 `printf 1`: command in the log differs from the command exec typed."]
+
+
+# ------------------------------------------------------------------- poll groups
+
+GET = 'curl -s https://x/v1/batches/276 | jq \'{id, status}\''
+
+
+@pytest.fixture
+def poll_dir(tmp_path):
+    log = (
+        entry(1, "kubectl config current-context", b"staging\r\n", t=1000.0)
+        + entry(2, GET, b'{ "id": 276, "status": "PENDING" }\r\n', t=1010.0)
+        + entry(3, GET, b'{ "id": 276, "status": "PENDING" }\r\n', t=1030.0)
+        + entry(4, "echo typed by human", b"typed by human\r\n", t=1040.0)
+        + entry(5, GET, b'{ "id": 276, "status": "PROCESSED" }\r\n', t=1050.0, dur=1.0)
+    )
+    execs = [{"id": 1, "command": "kubectl config current-context"}] + [
+        {"id": i, "command": GET, "poll_id": 1} for i in (2, 3, 5)
+    ]
+    polls = [{"poll_id": 1, "command": GET, "until": "PROCESSED", "interval": 20,
+              "max_attempts": 10, "attempts": [2, 3, 5], "outcome": "matched"}]
+    return make_dir(tmp_path, log, execs, polls)
+
+
+def _poll_verdicts(evidence):
+    return {"tests": [{"id": "T1", "goal": "batch gets processed", "expected": "PROCESSED",
+                       "verdict": "pass", "evidence": evidence}]}
+
+
+POLL_BLOCK = [
+    "### 🤖 #2–#5 · " + report._time(1010.0) + " · polled 3× over 41 s until /PROCESSED/ (matched)",
+    "```",
+    f"$ {GET}",
+    "[attempt 1 · " + report._time(1010.0) + "]",
+    '{ "id": 276, "status": "PENDING" }',
+    "[attempt 3 · " + report._time(1050.0) + "]",
+    '{ "id": 276, "status": "PROCESSED" }',
+    "```",
+]
+
+
+@pytest.mark.parametrize("evidence", [[{"poll": 1}], [3], [2, 5], [{"entry": 5}], [{"poll": 1}, 3]])
+def test_cited_poll_folds_into_one_block(poll_dir, evidence):
+    path, warnings = report.render_report(poll_dir, _poll_verdicts(evidence))
+    md = path.read_text()
+    assert "\n".join(POLL_BLOCK) in md
+    assert md.count("### ") == 1
+    # the human's command between attempts is surfaced, as for any test
+    assert "👤 Manual entries during this test: #4" in md
+    assert warnings == ["Manual entries no verdict cites: #4 (`echo typed by human`)."]
+
+
+def test_attempt_with_line_range_is_not_folded(poll_dir):
+    path, _ = report.render_report(poll_dir, _poll_verdicts([{"entry": 3, "lines": "1"}]))
+    md = path.read_text()
+    assert "polled" not in md and "### 🤖 #3 · " in md
+
+
+def test_unknown_poll_is_warned(poll_dir):
+    _, warnings = report.render_report(poll_dir, _poll_verdicts([{"poll": 7}, 1]))
+    assert "T1: cites poll P7, which is not in the session index." in warnings
+
+
+def test_poll_image_evidence(poll_dir, fake_freeze):
+    path, _ = report.render_report(poll_dir, _poll_verdicts([5]), "both")
+    md = path.read_text()
+    assert "![poll P1 #2-#5](evidence/T1-1.png)" in md
+    assert fake_freeze["T1-1.png"] == POLL_BLOCK[2:-1]
+
+
+def test_single_attempt_poll(tmp_path):
+    log = entry(1, GET, b'{ "status": "PROCESSED" }\r\n', t=1000.0)
+    d = make_dir(tmp_path, log, [{"id": 1, "command": GET, "poll_id": 1}],
+                 [{"poll_id": 1, "command": GET, "until": "PROCESSED", "attempts": [1], "outcome": "matched"}])
+    md = report.render_report(d, _poll_verdicts([1]))[0].read_text()
+    assert "### 🤖 #1 · " in md and "polled 1× over 0 s" in md and md.count("[attempt") == 1
+
+
+def test_poll_index_is_covered_by_the_hash(poll_dir):
+    doc = json.loads((poll_dir / session.INDEX_NAME).read_text())
+    doc["polls"][0]["outcome"] = "exhausted"
+    (poll_dir / session.INDEX_NAME).write_text(json.dumps(doc))
+    with pytest.raises(session.SessionError, match="changed after"):
+        report.render_report(poll_dir, _poll_verdicts([1]))

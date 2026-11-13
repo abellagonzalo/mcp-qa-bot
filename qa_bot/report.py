@@ -3,7 +3,8 @@
 Everything above the ``###`` evidence blocks comes from the verdicts the agent wrote;
 the evidence blocks are copied verbatim from the cleaned log entries, as text, as images
 drawn from the same lines (``evidence.py``), or both. The agent never writes evidence
-itself.
+itself. A cited poll group (``poll`` tool) is one block showing its first and last
+attempt.
 """
 
 from __future__ import annotations
@@ -45,6 +46,34 @@ class Citation:
     lines: tuple[int, int] | None  # 1-based inclusive range, None = whole entry
 
 
+    @property
+    def entry_ids(self) -> list[int]:
+        return [self.entry.id]
+
+
+@dataclass(frozen=True)
+class PollGroup:
+    """A ``poll`` call as recorded in the index: its attempts are entry ids in the log."""
+
+    poll_id: int
+    command: str
+    until: str
+    outcome: str
+    attempts: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class PollCitation:
+    """Cites a whole poll group; shown as one block (first and last attempt)."""
+
+    group: PollGroup
+    entries: tuple[transcript.Entry, ...]  # attempts found in the log, in order
+
+    @property
+    def entry_ids(self) -> list[int]:
+        return [e.id for e in self.entries]
+
+
 @dataclass(frozen=True)
 class MissingCitation:
     """Cites an ``exec`` call that left no markers in the log (always warned about)."""
@@ -63,11 +92,15 @@ class TestCase:
     expected: str
     actual: str
     note: str
-    citations: list[Citation | MissingCitation]
+    citations: list[Citation | PollCitation | MissingCitation]
 
     @property
-    def evidence(self) -> list[Citation]:
-        return [c for c in self.citations if isinstance(c, Citation)]
+    def evidence(self) -> list[Citation | PollCitation]:
+        return [c for c in self.citations if not isinstance(c, MissingCitation)]
+
+    @property
+    def cited_ids(self) -> set[int]:
+        return {i for c in self.evidence for i in c.entry_ids}
 
 
 @dataclass
@@ -114,19 +147,65 @@ def _text(value) -> str:
 # ---------------------------------------------------------------- validation
 
 
-def _parse_citation(
-    item, t: transcript.Transcript, missing_ids: set[int], test_id: str, warnings: list[str]
-) -> Citation | MissingCitation | None:
+def parse_polls(raw) -> list[PollGroup]:
+    """Poll groups from the index (absent in sessions recorded before ``poll`` existed)."""
+    groups: list[PollGroup] = []
+    for g in raw if isinstance(raw, list) else []:
+        if not isinstance(g, dict) or not isinstance(g.get("poll_id"), int):
+            continue
+        attempts = tuple(a for a in g.get("attempts") or [] if isinstance(a, int) and not isinstance(a, bool))
+        groups.append(
+            PollGroup(g["poll_id"], _text(g.get("command")), _text(g.get("until")), _text(g.get("outcome")), attempts)
+        )
+    return groups
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _poll_citation(
+    group: PollGroup, t: transcript.Transcript, test_id: str, warnings: list[str]
+) -> PollCitation | None:
     by_id = t.by_id()
-    if isinstance(item, bool):
-        item = None
-    if isinstance(item, int):
+    entries = tuple(by_id[a] for a in group.attempts if a in by_id)
+    if not entries:
+        warnings.append(f"{test_id}: cites poll P{group.poll_id}, which has no attempts in the log.")
+        return None
+    return PollCitation(group, entries)
+
+
+def _parse_citation(
+    item,
+    t: transcript.Transcript,
+    missing_ids: set[int],
+    test_id: str,
+    warnings: list[str],
+    polls: list[PollGroup] | None = None,
+) -> Citation | PollCitation | MissingCitation | None:
+    by_id = t.by_id()
+    polls = polls or []
+    if isinstance(item, dict) and set(item) == {"poll"} and _is_int(item["poll"]):
+        group = next((g for g in polls if g.poll_id == item["poll"]), None)
+        if group is None:
+            warnings.append(f"{test_id}: cites poll P{item['poll']}, which is not in the session index.")
+            return None
+        return _poll_citation(group, t, test_id, warnings)
+    if _is_int(item):
         eid, lines = item, None
-    elif isinstance(item, dict) and isinstance(item.get("entry"), int) and not isinstance(item.get("entry"), bool):
+    elif isinstance(item, dict) and _is_int(item.get("entry")):
         eid, lines = item["entry"], item.get("lines")
     else:
-        warnings.append(f"{test_id}: evidence item {json.dumps(item)} is not an entry id or {{\"entry\": id, \"lines\": \"a-b\"}}.")
+        warnings.append(
+            f"{test_id}: evidence item {json.dumps(item)} is not an entry id, "
+            f"{{\"entry\": id, \"lines\": \"a-b\"}} or {{\"poll\": n}}."
+        )
         return None
+
+    if lines is None and eid in by_id:
+        group = next((g for g in polls if eid in g.attempts), None)
+        if group is not None:  # an attempt cited whole stands for its poll group
+            return _poll_citation(group, t, test_id, warnings)
 
     entry = by_id.get(eid)
     if entry is None:
@@ -154,7 +233,9 @@ def _parse_citation(
     return Citation(entry, (start, end))
 
 
-def parse_verdicts(verdicts: dict, t: transcript.Transcript, missing: list[dict]) -> Verdicts:
+def parse_verdicts(
+    verdicts: dict, t: transcript.Transcript, missing: list[dict], polls: list[PollGroup] | None = None
+) -> Verdicts:
     """Parse the agent's verdicts once into a normalized model, collecting warnings.
 
     Raises ``ReportError`` only when the shape is unusable (not an object, no test list).
@@ -198,7 +279,16 @@ def parse_verdicts(verdicts: dict, t: transcript.Transcript, missing: list[dict]
         elif not isinstance(items, list):
             warnings.append(f"{tid}: 'evidence' must be a list.")
             items = []
-        cits = [c for item in items if (c := _parse_citation(item, t, missing_ids, tid, warnings))]
+        cits: list[Citation | PollCitation | MissingCitation] = []
+        seen_polls: set[int] = set()
+        for item in items:
+            c = _parse_citation(item, t, missing_ids, tid, warnings, polls)
+            if isinstance(c, PollCitation):
+                if c.group.poll_id in seen_polls:
+                    continue  # several attempts of one poll cited: one block
+                seen_polls.add(c.group.poll_id)
+            if c is not None:
+                cits.append(c)
         case = TestCase(
             id=tid,
             goal=goal,
@@ -212,11 +302,15 @@ def parse_verdicts(verdicts: dict, t: transcript.Transcript, missing: list[dict]
         if not case.evidence and verdict != "skipped":
             warnings.append(f"{tid}: cites no log entries.")
         for c in case.evidence:
-            if c.lines is None and len(c.entry.lines) > limit:
-                warnings.append(
-                    f"{tid}: #{c.entry.id} has {len(c.entry.lines)} lines; cited whole it is cut at "
-                    f"{limit} lines. Cite a line range instead."
-                )
+            shown = [c.entry] if isinstance(c, Citation) and c.lines is None else []
+            if isinstance(c, PollCitation):
+                shown = _poll_shown(c)
+            for e in shown:
+                if len(e.lines) > limit:
+                    warnings.append(
+                        f"{tid}: #{e.id} has {len(e.lines)} lines; cited whole it is cut at "
+                        f"{limit} lines. Cite a line range instead."
+                    )
         tests.append(case)
     return Verdicts(
         ticket=_text(verdicts.get("ticket")),
@@ -233,7 +327,7 @@ def log_anomalies(t: transcript.Transcript, missing: list[dict], tests: list[Tes
     Forged or stray markers, ``exec`` calls with no markers, flagged entries no verdict
     cites, and manual entries no verdict cites (they may have changed state).
     """
-    cited = {c.entry.id for test in tests for c in test.evidence}
+    cited = {i for test in tests for i in test.cited_ids}
     out: list[str] = []
     for s in t.stray:
         where = f"inside the output of #{s.inside}" if s.inside is not None else "at top level"
@@ -260,8 +354,48 @@ def log_anomalies(t: transcript.Transcript, missing: list[dict], tests: list[Tes
 # ----------------------------------------------------------------- rendering
 
 
-def _evidence_body(c: Citation) -> tuple[list[str], list[str], int]:
+def _poll_shown(c: PollCitation) -> list[transcript.Entry]:
+    """The attempts a poll block shows: the first and the last."""
+    return [c.entries[0]] if len(c.entries) == 1 else [c.entries[0], c.entries[-1]]
+
+
+def _capped(lines: list[str]) -> tuple[list[str], str | None]:
+    limit = max_uncited_lines()
+    if len(lines) <= limit:
+        return lines, None
+    return lines[:limit], f"… {len(lines) - limit} more lines not shown (lines 1-{limit} of {len(lines)})"
+
+
+def _poll_body(c: PollCitation) -> tuple[list[str], list[str], int]:
+    g = c.group
+    first, last = c.entries[0], c.entries[-1]
+    ids = f"#{first.id}" if first is last else f"#{first.id}–#{last.id}"
+    head = [f"{SOURCE_ICONS.get(first.source, '❔')} {ids}", _time(first.started)]
+    end = last.ended or last.started
+    elapsed = max(0, round(end - first.started)) if first.started and end else 0
+    n = len(g.attempts)
+    head.append(f"polled {n}× over {elapsed} s until /{g.until}/ ({g.outcome or 'unknown'})")
+    cmd_lines = first.command.split("\n")
+    body = [f"$ {cmd_lines[0]}", *cmd_lines[1:]]
+    count = 0
+    for e in _poll_shown(c):
+        attempt = g.attempts.index(e.id) + 1
+        label = [f"attempt {attempt}", _time(e.started)]
+        if e.exit_code != 0:
+            label.append(f"exit {e.exit_code}" if e.finished else "still running")
+        body.append(f"[{' · '.join(label)}]")
+        shown, note = _capped(e.lines)
+        body += shown
+        count += len(shown)
+        if note:
+            body.append(note)
+    return head, body, count
+
+
+def _evidence_body(c: Citation | PollCitation) -> tuple[list[str], list[str], int]:
     """Heading parts, ``$ command`` + shown output lines (+ truncation note), output line count."""
+    if isinstance(c, PollCitation):
+        return _poll_body(c)
     e = c.entry
     head = [f"{SOURCE_ICONS.get(e.source, '❔')} #{e.id}", _time(e.started)]
     head.append(f"exit {e.exit_code}" if e.finished else "still running")
@@ -274,10 +408,7 @@ def _evidence_body(c: Citation) -> tuple[list[str], list[str], int]:
         head.append(f"lines {a}-{b}" if a != b else f"line {a}")
         shown = lines[a - 1 : b]
     else:
-        limit = max_uncited_lines()
-        shown = lines[:limit]
-        if len(lines) > limit:
-            note = f"… {len(lines) - limit} more lines not shown (lines 1-{limit} of {len(lines)})"
+        shown, note = _capped(lines)
     cmd_lines = e.command.split("\n")
     body = [f"$ {cmd_lines[0]}", *cmd_lines[1:], *shown]
     if note:
@@ -285,20 +416,32 @@ def _evidence_body(c: Citation) -> tuple[list[str], list[str], int]:
     return head, body, len(shown)
 
 
-def _evidence_block(c: Citation, mode: str = "text", image: Path | None = None) -> list[str]:
+def _flags(c: Citation | PollCitation) -> list[str]:
+    if isinstance(c, Citation):
+        return list(c.entry.flags)
+    return [f"#{e.id}: {flag}" for e in c.entries for flag in e.flags]
+
+
+def _alt(c: Citation | PollCitation) -> str:
+    if isinstance(c, PollCitation):
+        return f"poll P{c.group.poll_id} #{c.entries[0].id}-#{c.entries[-1].id}"
+    return f"#{c.entry.id}" + (f" lines {c.lines[0]}-{c.lines[1]}" if c.lines else "")
+
+
+def _evidence_block(c: Citation | PollCitation, mode: str = "text", image: Path | None = None) -> list[str]:
     """One evidence block: heading, flags, then the cited lines as text, image or both.
 
     Text and image are drawn from the same ``body`` lines, so they cannot disagree.
     """
     head, body, _ = _evidence_body(c)
     out = [f"### {' · '.join(head)}"]
-    for flag in c.entry.flags:
+    for flag in _flags(c):
         out.append(f"> ⚠️ {flag}")
     if mode in ("image", "both"):
         if image is None:
             raise ReportError("image evidence needs an image path.")
         evidence.render_png(body, image)
-        alt = f"#{c.entry.id}" + (f" lines {c.lines[0]}-{c.lines[1]}" if c.lines else "")
+        alt = _alt(c)
         out += [f"![{alt}]({evidence.EVIDENCE_DIR}/{image.name})", ""]
     fence = _fence(body)
     if mode == "text":
@@ -316,6 +459,7 @@ def render(
     log_hash: str,
     mode: str = "text",
     directory: Path | None = None,
+    polls: list[PollGroup] | None = None,
 ) -> tuple[str, list[str]]:
     """Render the report markdown. ``mode`` is text, image or both; image modes write
     PNGs into ``<directory>/evidence/``."""
@@ -324,7 +468,7 @@ def render(
     images = mode in ("image", "both")
     if images and directory is None:
         raise ReportError("image evidence needs the session folder.")
-    model = parse_verdicts(verdicts, t, missing)
+    model = parse_verdicts(verdicts, t, missing, polls)
     warnings = model.warnings
     if images:
         img_limit = evidence.max_image_lines()
@@ -333,7 +477,7 @@ def render(
                 shown = _evidence_body(c)[2]
                 if shown > img_limit:
                     warnings.append(
-                        f"{test.id}: #{c.entry.id} shows {shown} lines; an image over {img_limit} lines "
+                        f"{test.id}: {_alt(c).split(' lines')[0]} shows {shown} lines; an image over {img_limit} lines "
                         "is hard to read. Cite a narrower line range."
                     )
 
@@ -371,8 +515,8 @@ def render(
         ]
         out += [f"**{label}:** {value}  " for label, value in fields if value]
         if cits:
-            ids = [c.entry.id for c in cits]
-            cited = set(ids)
+            cited = test.cited_ids
+            ids = sorted(cited)
             manual = [
                 e for e in t.entries
                 if e.source == "manual" and min(ids) < e.id < max(ids) and e.id not in cited
@@ -434,10 +578,12 @@ def render_report(
     else:
         raise ReportError(f"No verdicts given and {verdicts_path} does not exist.")
 
-    index = json.loads((directory / sess.INDEX_NAME).read_text()).get("execs", [])
+    index_doc = json.loads((directory / sess.INDEX_NAME).read_text())
+    index = index_doc.get("execs", [])
+    polls = parse_polls(index_doc.get("polls"))
     t = transcript.parse((directory / sess.LOG_NAME).read_bytes())
     missing = transcript.classify(t, index)
-    markdown, warnings = render(verdicts, t, missing, log_hash, mode, directory)
+    markdown, warnings = render(verdicts, t, missing, log_hash, mode, directory, polls)
     report_path = directory / REPORT_NAME
     report_path.write_text(markdown)
     return report_path, warnings

@@ -5,7 +5,7 @@ Runs shell commands in a tmux pane a human can watch (and type in), records
 everything that runs there, and renders a report from verdicts it is given. It knows
 nothing about QA itself; the workflow lives in the QA skill (skills/manual-qa).
 
-Tools: preferred_tools, open_session, exec, peek, interrupt, close_session, render_report.
+Tools: preferred_tools, open_session, exec, poll, peek, interrupt, close_session, render_report.
 
 Preferred tools (guidance for the agent, not enforced): ~/.config/qa-bot/tools.md
 (system) merged with the nearest .qa-bot/tools.md at or above the session folder
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -34,6 +35,8 @@ from qa_bot.limits import CommandNotAllowed, validate_command
 from qa_bot.session import Session, SessionError
 
 MAX_TIMEOUT = 1800.0
+MAX_POLL_INTERVAL = 600.0
+MAX_POLL_ATTEMPTS = 100
 
 mcp = FastMCP("mcp-qa-bot")
 _lock = asyncio.Lock()
@@ -52,6 +55,18 @@ def _require_session() -> Session:
     if _session is None or _session.closed:
         raise SessionError("No open session. Call open_session first.")
     return _session
+
+
+def _check_production(session: Session, command: str) -> None:
+    """Refuse if the command or the pane's kube/DB context looks like production."""
+    pane_env = safety.read_pane_env(session.pane_env_path())
+    kube = safety.kube_context(pane_env)
+    safety.check_not_production(command, pane_env, kube)
+
+
+def _wait(timeout: float | None) -> float:
+    wait = _env_number("QA_BOT_DEFAULT_TIMEOUT", 60) if timeout is None else timeout
+    return max(1.0, min(float(wait), MAX_TIMEOUT))
 
 
 def _numbered(lines: list[str], max_lines: int) -> str:
@@ -120,7 +135,8 @@ async def exec_command(command: str, timeout: float | None = None) -> str:
 
     Use literal values (full URL, ids, payloads) so the command itself is the proof.
     Split long commands over lines with trailing '\\' continuations; multi-line SQL goes
-    in one heredoc, e.g. psql ... <<'SQL' / ... / SQL.
+    in one heredoc, e.g. psql ... <<'SQL' / ... / SQL. for/while/until loops are allowed,
+    on one line or over several (do ... done); to wait for a state, prefer poll.
 
     Any executable may run; prefer the tools from preferred_tools. Refused (hard
     limits): $(...)/backticks, output redirection (except 2>&1 and >/dev/null), background jobs (&, nohup, disown),
@@ -139,12 +155,8 @@ async def exec_command(command: str, timeout: float | None = None) -> str:
     async with _lock:
         session = _require_session()
         validate_command(command)
-        pane_env = safety.read_pane_env(session.pane_env_path())
-        kube = await asyncio.to_thread(safety.kube_context, pane_env)
-        safety.check_not_production(command, pane_env, kube)
-
-        wait = _env_number("QA_BOT_DEFAULT_TIMEOUT", 60) if timeout is None else timeout
-        wait = max(1.0, min(float(wait), MAX_TIMEOUT))
+        await asyncio.to_thread(_check_production, session, command)
+        wait = _wait(timeout)
         result = await asyncio.to_thread(session.exec, command, wait)
 
     max_lines = int(_env_number("QA_BOT_EXEC_MAX_LINES", 300))
@@ -164,6 +176,78 @@ async def exec_command(command: str, timeout: float | None = None) -> str:
     else:
         header += f" · exit {result.exit_code} · {result.duration_ms} ms"
     return f"{header}\n{_numbered(result.output, max_lines)}"
+
+
+@mcp.tool()
+async def poll(
+    command: str,
+    until: str,
+    interval: float = 20,
+    max_attempts: int = 10,
+    timeout: float | None = None,
+) -> str:
+    """Run a command repeatedly until its output matches a regex: for async work
+    (scheduler jobs, listeners, delayed processing) that reaches a state later.
+
+    Each attempt is typed into the pane like exec, with the same hard limits and
+    production check, and is recorded as its own log entry. The attempts form one poll
+    group (P<n>) in the session index; citing any attempt's entry id (or
+    {"poll": n}) in a verdict shows the group as one evidence block.
+
+    Args:
+        command: Shell command, same rules as exec. Typically a read: an HTTP GET or a
+            select that shows the state.
+        until: Python regex searched in the attempt's output (multi-line), e.g.
+            '"status": "PROCESSED"'.
+        interval: Seconds between attempts (default 20).
+        max_attempts: Attempts before giving up (default 10).
+        timeout: Seconds each attempt may run (default 60).
+
+    Returns the outcome: matched, exhausted (no match after max_attempts), busy (the
+    human is typing or a command is running; nothing more was typed), timeout (an
+    attempt is still running: peek or interrupt), or interrupted (Ctrl-C). Also the
+    number of attempts, elapsed time, the entry ids and the last attempt's numbered
+    output.
+    """
+    try:
+        re.compile(until, re.M)
+    except re.error as exc:
+        raise ValueError(f"'until' is not a valid regex: {exc}") from exc
+    interval = max(1.0, min(float(interval), MAX_POLL_INTERVAL))
+    max_attempts = max(1, min(int(max_attempts), MAX_POLL_ATTEMPTS))
+    async with _lock:
+        session = _require_session()
+        validate_command(command)
+        wait = _wait(timeout)
+        result = await asyncio.to_thread(
+            session.poll,
+            command,
+            until,
+            interval,
+            max_attempts,
+            wait,
+            lambda: _check_production(session, command),
+        )
+
+    ids = result.entry_ids
+    entries = ", ".join(f"#{i}" for i in ids) or "none"
+    header = (
+        f"P{result.poll_id} · {result.outcome} after {len(result.attempts)} attempt(s) "
+        f"in {result.elapsed_s:.0f} s · entries {entries}"
+    )
+    if result.outcome == "busy":
+        header += "\nBUSY: a command is running or the prompt is not empty (the human may be typing)."
+    if not result.attempts:
+        return header
+    last = result.attempts[-1]
+    max_lines = int(_env_number("QA_BOT_EXEC_MAX_LINES", 300))
+    if last.entry_id is None:
+        return f"{header}\nLast attempt: no start marker seen. Pane:\n" + "\n".join(last.output)
+    if last.status == "TIMEOUT":
+        detail = f"#{last.entry_id} still running after {wait:g}s (peek / interrupt)"
+    else:
+        detail = f"#{last.entry_id} · exit {last.exit_code} · {last.duration_ms} ms"
+    return f"{header}\nLast attempt {detail}\n{_numbered(last.output, max_lines)}"
 
 
 @mcp.tool()
@@ -212,7 +296,10 @@ async def render_report(
             otherwise <dir>/verdicts.json is read. Shape:
             {"ticket", "env", "build", "tests": [{"id", "goal", "input", "expected",
             "verdict": "pass|fail|skipped", "actual", "note",
-            "evidence": [2, {"entry": 4, "lines": "1-3"}]}]}
+            "evidence": [2, {"entry": 4, "lines": "1-3"}, {"poll": 1}]}]}
+            An entry id that belongs to a poll group (or {"poll": n}) shows the whole
+            group as one block: first and last attempt. Cite {"entry": id, "lines": ...}
+            to show just that attempt.
         dir: Session folder (default: the last session opened).
         evidence: How cited log lines appear in the report. "text": code blocks.
             "image": PNGs rendered from the same lines into <dir>/evidence/ (needs

@@ -19,6 +19,7 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
 | `preferred_tools(dir?)` | Reads the [preferred tools](#preferred-tools) for the project, for planning | merged Markdown list |
 | `open_session(name, dir)` | Creates the session folder and tmux session (the user's own zsh), loads the hooks, starts recording | session id, `tmux attach` command, folder, preferred tools |
 | `exec(command, timeout?)` | Types the command into the pane exactly as written and waits for the hooks to signal it finished | entry id `#N`, exit code, duration, numbered output; or `TIMEOUT` / `BUSY` |
+| `poll(command, until, interval?, max_attempts?, timeout?)` | Runs the command like `exec`, once per attempt, `interval` s apart (default 20, max 10 attempts), until the output matches the `until` regex. Each attempt is its own entry; the attempts are recorded as one poll group | poll id `P<n>`, outcome (`matched` / `exhausted` / `busy` / `timeout` / `interrupted`), attempts, elapsed time, entry ids, last attempt's numbered output |
 | `peek(lines?)` | Shows the pane's recent contents | text + `idle` / `running` / `typing` |
 | `interrupt()` | Sends Ctrl-C | state |
 | `close_session(keep_tmux?)` | Stops recording, writes the exec index and the hashes | log path, entry count, sha256 |
@@ -63,7 +64,9 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
   [Preferred tools](#preferred-tools)).
 - Refused: `$(…)`, backticks, process substitution, output redirection (`2>&1` and
   `>/dev/null` are fine), background jobs (`&`, `nohup`, `disown`), and multi-line input
-  other than `\` line continuations and a single heredoc.
+  other than `\` line continuations, a single heredoc, or a `for`/`while`/`until … done`
+  loop. Every other limit still applies inside a loop.
+- `poll` runs each attempt through the same limits and the production check.
 - Refused SQL, anywhere in the command: `TRUNCATE`, `DROP …`, and `DELETE`/`UPDATE`
   without `WHERE`.
 - Production guard, checked before every `exec` because a human can switch context
@@ -98,7 +101,7 @@ is kept from both. See [`examples/tools.md`](examples/tools.md).
   qa-report.md          # rendered by render_report
   verdicts.json         # written by the skill (or by render_report from its argument)
   session.log           # raw tmux transcript, markers included
-  session.index.json    # exec calls: id, command, timestamp
+  session.index.json    # exec calls (id, command, timestamp, poll id) and poll groups
   session.log.sha256    # sha256 of log + index (`shasum -a 256 -c session.log.sha256`)
   evidence/             # images of cited lines (<test>-<k>.png), only with evidence=image|both
   inputs/               # test inputs (payloads, CSVs)

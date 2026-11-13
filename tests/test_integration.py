@@ -116,3 +116,46 @@ def test_full_session(qa):
     assert "> - Manual entries no verdict cites: #7 (`e manual`)." in md
     assert "Manual entries during this test" not in md  # #7 is after #4
     assert "## Timeline" not in md
+
+
+def test_multiline_loop_and_poll(qa):
+    loop = "for i in 1 2 3; do\n  echo \"n=$i\"\ndone"
+    r1 = qa.exec(loop, timeout=10)
+    assert (r1.status, r1.entry_id, r1.exit_code, r1.output) == ("done", 1, 0, ["n=1", "n=2", "n=3"])
+
+    state = qa.dir / "inputs" / "state.txt"
+    state.write_text("PENDING\n")
+    calls = []
+
+    def before_attempt():
+        calls.append(1)
+        if len(calls) == 3:
+            state.write_text("PROCESSED\n")
+
+    p = qa.poll("cat inputs/state.txt", "PROCESSED", 0.2, 5, 10, before_attempt)
+    assert (p.poll_id, p.outcome, p.entry_ids) == (1, "matched", [2, 3, 4])
+    assert p.attempts[-1].output == ["PROCESSED"]
+
+    p2 = qa.poll("cat inputs/state.txt", "NEVER", 0.1, 2, 10)
+    assert (p2.poll_id, p2.outcome, p2.entry_ids) == (2, "exhausted", [5, 6])
+
+    qa.close()
+    doc = json.loads((qa.dir / session.INDEX_NAME).read_text())
+    assert [(g["poll_id"], g["attempts"], g["outcome"]) for g in doc["polls"]] == [
+        (1, [2, 3, 4], "matched"),
+        (2, [5, 6], "exhausted"),
+    ]
+    assert [e.get("poll_id") for e in doc["execs"]] == [None, 1, 1, 1, 2, 2]
+
+    path, warnings = report.render_report(
+        qa.dir,
+        {"tests": [
+            {"id": "T1", "goal": "loop", "expected": "3 lines", "verdict": "pass", "evidence": [1]},
+            {"id": "T2", "goal": "poll", "expected": "PROCESSED", "verdict": "pass", "evidence": [3]},
+        ]},
+    )
+    assert warnings == []
+    md = path.read_text()
+    assert "### 🤖 #2–#4 · " in md and "polled 3× over" in md and "until /PROCESSED/ (matched)" in md
+    assert "[attempt 1 · " in md and "[attempt 3 · " in md and "[attempt 2 · " not in md
+    assert "$ for i in 1 2 3; do\n  echo \"n=$i\"\ndone\nn=1\nn=2\nn=3" in md
