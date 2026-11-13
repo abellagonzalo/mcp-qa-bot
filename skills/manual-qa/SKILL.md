@@ -13,24 +13,94 @@ report. You plan, run and judge. You never write evidence yourself.
 **Production is never a target.** Only dev or staging. The tool refuses production
 contexts too, but never try to work around a refusal.
 
+## Arguments
+
+All optional:
+
+- **Target**: a PR (number or URL), or a named feature (a ticket id or a description).
+  Neither given → the PR of the current branch. No PR there → ask.
+- **Environment**: `staging` (default) or `dev`.
+- **Base URL, credentials, input files**: anything missing is asked for in the plan,
+  not up front.
+
 ## 1. Understand (read-only)
 
-- Call `preferred_tools(dir)` with the planned session folder (e.g. `./qa/<ticket>-<date>`
-  in the repo) and plan with those tools: they say which command to use for HTTP, DB
-  reads, auth and cluster checks in this project. If none are configured, use what the
-  repo and the env clearly support, and say so in the plan.
-- Read the ticket or PR, the diff, and the service's code: endpoints, request
-  shapes, feature flags, DB tables, and which process does any async work. The repo is
-  the source of truth for endpoints.
-- Read the target env's config and check which build it is running, e.g.
+Read-only commands only in this phase (cluster reads, `select`, HTTP `GET`s with no
+side effects).
+
+### Tools
+
+Call `preferred_tools(dir)` with the planned session folder (e.g.
+`./qa/<ticket>-<date>` in the repo) and plan with those tools: they say which command
+to use for HTTP, DB reads, auth, cluster checks, tickets, PRs and deploys in this
+project. If none are configured for a job, use what the repo and the env clearly
+support, and say so in the plan.
+
+### The change
+
+- **PR target**: read the PR description and the diff with the configured PR tool. If
+  the description embeds images or attachments (e.g. earlier QA evidence), read them
+  too: they show what was already tested and how.
+- **Named feature** (a ticket or a description, no PR): find the code that implements
+  it (search the repo, the git log, the ticket's links), then confirm that code is in
+  the build the env runs (below).
+- Read the linked ticket when one exists, with the configured ticket tool.
+- Read the service's code: endpoints, request shapes, feature flags, DB tables, and
+  which process does any async work (app, worker, scheduler). The repo is the source
+  of truth for endpoints.
+
+### The deployed build
+
+- Find the image tag or commit the env runs, for the app and for any worker or
+  scheduler deployment the change touches, e.g.
   `kubectl get deploy <svc> -o jsonpath='{.spec.template.spec.containers[0].image}'`.
-  If the change isn't deployed there, stop and tell the user.
-- Read-only commands only in this phase (cluster reads, `select`, HTTP GETs).
+- PR target: compare it with the PR head. If the PR isn't deployed, or the env is
+  behind by commits that touch application code, **the deploy becomes a plan
+  prerequisite**: write the deploy command with the configured deploy tool and put it
+  through the danger review like any other dangerous command. Don't stop.
+- Once any deploy has rolled out, check the deployed build again right before the
+  first test call.
+
+### Behaviours
+
+Name the behaviours the change adds or touches (endpoints, state transitions, jobs,
+validations, limits, flags), and the closest existing behaviour as the regression
+candidate. Understanding is done when every behaviour has:
+
+- how to trigger it;
+- how to observe it (API response, log line, DB row);
+- whether it is enabled on the env (feature flags, config);
+- the concrete test data it will use (ids, accounts).
 
 ## 2. Plan
 
 Pick **3–5 tests**: the happy path, the riskiest edge case, and a regression check on
-the nearest existing behaviour. For each test, write:
+the nearest existing behaviour.
+
+- **One representative input per test.** Leave combinations to unit and integration
+  tests. Size inputs to the behaviour: big enough to cross a limit, no bigger.
+- An **idempotency check** resubmits the same key and the same payload after a first
+  submit that succeeded.
+- Behaviour that can't be triggered from outside (it needs a code change, a fault
+  injection, a credential you don't have) is listed as **skipped**, with the reason.
+
+### Plan header
+
+Start the plan with:
+
+- **Target**, **env**, **deployed build**, and whether the build matches the target.
+- **Prerequisites** (e.g. a deploy, a flag to turn on), each one a command that goes
+  through the danger review.
+- **Credentials needed**: every variable across all tests, e.g.
+  `$TOKEN (admin API token), $DB_URL (read-only DB URL)`, so the user knows what to load
+  before approving.
+- **Skipped tests**, with the reason.
+- **Side effects** the run leaves on the env (created rows, messages, jobs).
+- **Missing inputs** (base URL, credentials, ids, files), asked for in one message.
+
+### Tests
+
+For each test, write:
 
 - **Goal**: one line.
 - **Input**: payload or file (save it as `<dir>/inputs/<test>.json`).
@@ -80,10 +150,6 @@ the nearest existing behaviour. For each test, write:
   `exec`. Only ` \` continuations and one heredoc are allowed.
 - Created entities get **unique ids / idempotency keys** (e.g. `qa-pay123-t1-<date>`)
   so reruns don't collide.
-
-Start the plan with a **Credentials needed** line that lists every variable across all
-tests (e.g. `Credentials needed: $TOKEN (backoffice token), $DB_URL (read-only DB URL)`),
-so the user knows what to load before approving.
 
 ### Credentials
 
@@ -198,6 +264,8 @@ approval again. The user's own commands in the pane need no approval.
    the first `exec`. Commands finish in milliseconds, so without this pause the whole
    run is over before anyone can attach.
 2. Start with a context check, e.g. `kubectl config current-context`.
+   If the plan has a deploy prerequisite, run it now, wait for the rollout, and check
+   the deployed build again. Don't start testing until it matches the target.
 3. Run each approved command with `exec`. Note the entry id (`#N`) of every result;
    verdicts cite them. Line numbers in `exec` output are the ones you cite.
 4. If `exec` returns:
@@ -250,8 +318,8 @@ verdicts and render again until none are left. Warnings starting "Log anomaly" o
 can't be fixed through verdicts. Don't hide them by citing entries that don't support
 a test; list them for the user in your chat reply.
 
-Evidence is text by default. When the user wants images (to paste into Jira,
-Confluence or a PR), pass `evidence="image"`, or `"both"` to keep the text in a
+Evidence is text by default. When the user wants images (to paste into a ticket, a
+wiki page or a PR), pass `evidence="image"`, or `"both"` to keep the text in a
 collapsed block. Images are drawn from the cited lines, so cite tight line ranges: a
 warning flags any image over 60 lines. Then reply in chat with the report path, the
 pass/fail summary, any side effects left in the env (created rows, messages), and
