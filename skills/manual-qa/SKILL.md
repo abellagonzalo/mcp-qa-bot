@@ -112,12 +112,76 @@ curl -s \
 
 ## 3. Danger review
 
-Label every command **read-only** or **dangerous**. For each dangerous one, say what it
-changes (rows, messages, external calls) and whether and how it can be undone.
+Label every command **read-only** or **dangerous**.
 
-Any command that would print a credential (see [Credentials](#credentials)) is
-dangerous, even if it changes nothing. Avoid it: if you can't, say which secret it
-reveals and where it would end up (log, report, images).
+### What counts as dangerous
+
+Anything that changes state or leaks a secret:
+
+- HTTP requests other than `GET`/`HEAD`, and any `GET` whose handler writes or
+  triggers work (a "trigger", "run", "retry" endpoint). Read the handler to know.
+- SQL other than `select`, and any admin or write connection to a database, even if
+  the statement only reads.
+- Cluster changes: `kubectl apply|delete|patch|edit|scale|rollout|exec` and
+  `kubectl create job --from=cronjob/…`.
+- Deploys and CI workflow dispatches; publishing to a message broker (Kafka, RabbitMQ,
+  queues, topics).
+- Anything that notifies customers, moves money or books, even on staging.
+- Printing a credential (see [Credentials](#credentials)), even if it changes nothing.
+  Avoid it: if you can't, say which secret it reveals and where it would end up (log,
+  report, images).
+
+### What the plan shows
+
+The plan has a highlighted **⚠️ Dangerous commands: approval required** section with
+one entry per dangerous command:
+
+- the exact command, with literal ids;
+- what it changes, where (service, database and table, cluster object, topic), and
+  how many rows or entities;
+- whether it can be undone, and how;
+- for SQL, the `select` that shows the target rows and the expected row count;
+- why the test needs it.
+
+A plan without dangerous commands says so in one line instead: **No dangerous
+commands: every command is read-only.**
+
+### Surgical SQL writes
+
+- Never propose `truncate`, `drop`, or `delete`/`update` without a `where`. Never
+  propose a `where` that matches by range, pattern, date or status (`id > …`, `like`,
+  `created_at < …`, `state = 'FAILED'`), and never bulk-reset endpoints (purge, reset,
+  delete-all). `exec` refuses some of these; the rest are on you.
+- Change rows by primary key with literal values (`where id in (1201, 1202)`), and
+  only rows this run created or rows the plan names.
+- Run an approved write in two steps:
+  1. The same `where` as a `select`. Check that the count matches the plan before going
+     on.
+  2. The statement inside a transaction that checks the affected row count and rolls
+     back on any mismatch:
+
+  ```bash
+  psql -v ON_ERROR_STOP=1 "$DB_URL" <<'SQL'
+  begin;
+  do $$
+  declare
+    affected int;
+  begin
+    update transfers
+       set state = 'CANCELLED'
+     where id in (1201, 1202);
+    get diagnostics affected = row_count;
+    if affected <> 2 then
+      raise exception 'expected 2 rows, got %', affected;
+    end if;
+  end
+  $$;
+  commit;
+  SQL
+  ```
+
+  On a mismatch the exception aborts the transaction, `ON_ERROR_STOP` stops psql
+  before `commit`, and nothing is written.
 
 ## 4. Approval gate
 
