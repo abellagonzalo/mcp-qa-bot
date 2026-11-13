@@ -159,7 +159,7 @@ def test_multiline_loop_and_poll(qa):
     )
     assert warnings == []
     md = path.read_text()
-    assert "### 🤖 #2–#4 · " in md and "polled 3× over" in md and "until /PROCESSED/ (matched)" in md
+    assert "### E1 · 🤖 #2–#4 · " in md and "polled 3× over" in md and "until /PROCESSED/ (matched)" in md
     assert "[attempt 1 · " in md and "[attempt 3 · " in md and "[attempt 2 · " not in md
     assert "$ for i in 1 2 3; do\n  echo \"n=$i\"\ndone\nn=1\nn=2\nn=3" in md
 

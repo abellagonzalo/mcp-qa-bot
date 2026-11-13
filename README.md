@@ -54,9 +54,11 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
   markers). Entry output is cleaned deterministically: escape sequences are stripped
   and `\r` overwrites are replayed. Lines are numbered from 1 per entry.
 - The report has a summary table, the findings (things to act on even when tests pass),
-  a linked table of contents (one line per test), then one section per test: the
-  verdict in its heading, its checks as an expected/actual table, and its cited
-  evidence, each block headed by its `title`.
+  a linked table of contents (one line per test), then one section per test laid out
+  as a test case: the verdict in its heading, requirement, pre-conditions, test data,
+  numbered steps, numbered expected and actual results, then the cited evidence as
+  E1, E2 … blocks headed by their `title`. Each actual result links the evidence that
+  backs it; the proof of a failed check is shown right under it instead.
   There is no timeline of every entry. Anything wrong with the log instead becomes a
   warning, shown in a `[!WARNING]` box at the top and returned by `render_report`:
   each forged or stray marker, each `exec` call with no markers, each flagged entry

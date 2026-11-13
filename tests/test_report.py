@@ -89,7 +89,7 @@ def test_render_report(qa_dir):
     assert "6 entries)" in md
     assert "| T1 | Duplicate idempotency key is rejected | ❌ fail |" in md
     assert "👤 Manual entries during this test: #3 (`kubectl logs payments-7d9f`)" in md
-    assert "### 🤖 #2 · " in md and "· exit 0 · 312 ms" in md
+    assert "### E1 · 🤖 #2 · " in md and "· exit 0 · 312 ms" in md
     assert f"$ {POST}\n201\n" in md
     assert "· lines 1-3\n```\n$ psql -c 'select count(*) from transfers'\n count\n-------\n     2\n```" in md
     assert "## Timeline" not in md
@@ -179,31 +179,83 @@ def test_verdict_is_in_the_test_heading(clean_dir):
 
 
 CHECKS = [
-    {"check": "HTTP status", "expected": "`200`", "actual": "`200`", "ok": True},
-    {"check": "`status`", "expected": "`CANCELLED`", "actual": "`VALIDATED`", "ok": False},
+    {"check": "HTTP status", "expected": "`200`", "actual": "`200`", "ok": True, "evidence": [1]},
+    {"check": "`status`", "expected": "`CANCELLED`", "actual": "`VALIDATED`", "ok": False, "evidence": [2]},
 ]
 
 
-def test_checks_render_as_a_table(clean_dir):
+def test_checks_render_as_numbered_expected_and_actual_lists(clean_dir):
     verdicts = {"tests": [{"id": "T1", "goal": "g", "verdict": "fail", "checks": CHECKS,
-                           "note": "n", "evidence": [1]}]}
+                           "note": "n", "evidence": [1, {"entry": 2, "title": "POST returns 201"}]}]}
     path, warnings = report.render_report(clean_dir, verdicts)
     md = path.read_text()
     assert warnings == []
-    table = (
-        "| Check | Expected | Actual | |\n|---|---|---|---|\n"
-        "| HTTP status | `200` | `200` | ✅ |\n"
-        "| `status` | `CANCELLED` | `VALIDATED` | ❌ |\n"
+    expected = "**Expected result**\n\n1. HTTP status: `200`\n2. `status`: `CANCELLED`\n"
+    actual = (
+        "**Actual result**\n\n"
+        "1. ✅ HTTP status: `200` ([E1](#t1-1))\n"
+        "2. ❌ `status`: `VALIDATED` (expected `CANCELLED`)\n"
+        "\n"
+        '   <a id="t1-2"></a>**E2: POST returns 201**  \n'
+        "   🤖 #2 · "
     )
-    assert table in md
-    assert md.index(table) < md.index("**Note:** n")
+    assert expected in md and actual in md
+    assert md.index(expected) < md.index(actual) < md.index("**Note:** n")
+    assert "   ```\n" + f"   $ {POST}\n   201\n   ```\n" in md  # the failed check's proof, nested
+    # E1 backs a passing check: it stays in the Evidence section; E2 is shown only inline
+    assert "**Evidence**\n\n" in md and "### E1 · 🤖 #1 · " in md and "### E2" not in md
 
 
-def test_checks_pipes_are_escaped(clean_dir):
-    checks = [{"check": "a|b", "expected": "x", "actual": "y\nz", "ok": True}]
+def test_evidence_shared_by_two_failed_checks_is_shown_once(clean_dir):
+    checks = [
+        {"check": "a", "expected": "x", "actual": "y", "ok": False, "evidence": [1]},
+        {"check": "b", "expected": "x", "actual": "y", "ok": False, "evidence": [1, 2]},
+    ]
+    verdicts = {"tests": [{"id": "T1", "goal": "g", "verdict": "fail", "checks": checks, "evidence": [1, 2]}]}
+    md = report.render_report(clean_dir, verdicts)[0].read_text()
+    assert md.count('<a id="t1-1"></a>') == 1
+    assert "2. ❌ b: y (expected x) ([E1](#t1-1))\n" in md
+    assert "**Evidence**" not in md  # every block is inline under a failed check
+
+
+def test_checks_collapse_whitespace(clean_dir):
+    checks = [{"check": "a|b", "expected": "x", "actual": "y\nz", "ok": True, "evidence": [1]}]
     verdicts = {"tests": [{"id": "T1", "goal": "g", "verdict": "pass", "checks": checks, "evidence": [1]}]}
     md = report.render_report(clean_dir, verdicts)[0].read_text()
-    assert "| a\\|b | x | y z | ✅ |" in md
+    assert "1. ✅ a|b: y z ([E1](#t1-1))\n" in md
+
+
+def test_template_sections_render_in_order(clean_dir):
+    verdicts = {"tests": [{
+        "id": "T1", "goal": "g", "verdict": "pass", "requirement": "`PB-1`",
+        "preconditions": ["Batch `265` is `OPEN`"], "test_data": ["Batch ID: `265`", "User: `qa`"],
+        "steps": ["Send the cancel", "Read the row"], "checks": CHECKS[:1], "evidence": [1],
+    }]}
+    path, warnings = report.render_report(clean_dir, verdicts)
+    md = path.read_text()
+    assert warnings == []
+    parts = [
+        "**Requirement:** `PB-1`  \n",
+        "**Pre-conditions**\n\n1. Batch `265` is `OPEN`\n",
+        "**Test data**\n\n- Batch ID: `265`\n- User: `qa`\n",
+        "**Steps**\n\n1. Send the cancel\n2. Read the row\n",
+        "**Expected result**",
+        "**Actual result**",
+        "**Evidence**",
+    ]
+    assert all(p in md for p in parts)
+    assert [md.index(p) for p in parts] == sorted(md.index(p) for p in parts)
+
+
+@pytest.mark.parametrize("field, value, warning", [
+    ("steps", "one step", None),
+    ("steps", 3, "T1: 'steps' must be a list of strings."),
+    ("preconditions", ["ok", ""], "T1: preconditions item 2 must be a non-empty string."),
+])
+def test_template_lists_are_validated(clean_dir, field, value, warning):
+    verdicts = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", field: value, "evidence": [1]}]}
+    _, warnings = report.render_report(clean_dir, verdicts)
+    assert warnings == ([warning] if warning else [])
 
 
 @pytest.mark.parametrize("verdict, checks, warning", [
@@ -213,6 +265,12 @@ def test_checks_pipes_are_escaped(clean_dir):
     ("pass", [{"check": "c", "expected": "e", "ok": True}], "T1: check 'c' is missing 'actual'."),
     ("pass", [{"expected": "e", "actual": "a", "ok": True}], "T1: check 1 is missing 'check' (what is checked)."),
     ("pass", "nope", "T1: 'checks' must be a list."),
+    ("pass", [{"check": "c", "expected": "e", "actual": "a", "ok": True}],
+     "T1: check 'c' links no evidence (add \"evidence\": [n])."),
+    ("pass", [{"check": "c", "expected": "e", "actual": "a", "ok": True, "evidence": [3]}],
+     "T1: check 'c' cites E3, which is not in the test's evidence list."),
+    ("pass", [{"check": "c", "expected": "e", "actual": "a", "ok": True, "evidence": "E1"}],
+     "T1: check 'c' evidence must be positions in the test's evidence list, like [1, 2]."),
 ])
 def test_checks_are_validated(clean_dir, verdict, checks, warning):
     verdicts = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": verdict,
@@ -226,7 +284,9 @@ def test_skipped_test_checks_need_no_actual(clean_dir):
     verdicts = {"tests": [{"id": "T1", "goal": "g", "verdict": "skipped", "checks": checks, "note": "n"}]}
     path, warnings = report.render_report(clean_dir, verdicts)
     assert warnings == []
-    assert "| c | e | — | — |" in path.read_text()
+    md = path.read_text()
+    assert "**Expected result**\n\n1. c: e\n" in md
+    assert "**Actual result**" not in md
 
 
 def test_findings_section_comes_before_contents(clean_dir):
@@ -257,8 +317,8 @@ def test_evidence_titles_head_their_blocks(clean_dir):
     path, warnings = report.render_report(clean_dir, verdicts)
     md = path.read_text()
     assert warnings == []
-    assert "### Context is staging\n🤖 #1 · " in md
-    assert "### POST returns 201\n🤖 #2 · " in md
+    assert "### E1: Context is staging\n🤖 #1 · " in md
+    assert "### E2: POST returns 201\n🤖 #2 · " in md
     assert "](#t1-" not in md
 
 
@@ -291,7 +351,7 @@ def test_image_evidence(qa_dir, drawer):
     assert "![#4](evidence/T1-2.png)" in md
     assert "![#5 lines 1-3](evidence/T1-3.png)" in md
     assert f"$ {POST}\n201\n" not in md  # no text blocks in image mode
-    assert "### 🤖 #2 · " in md  # headings stay text
+    assert "### E1 · 🤖 #2 · " in md  # headings stay text
     assert "Images in evidence/ are rendered from the same lines" in md
     assert images(qa_dir) == ["T1-1.png", "T1-2.png", "T1-3.png"]
     assert sorted(p.name for p in qa_dir.iterdir() if p.name.startswith(".evidence")) == []
@@ -430,7 +490,7 @@ def test_render_from_an_in_memory_record():
         {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [1]}]}, rec
     )
     assert "Log: session.log (sha256 abab…abab, 2 entries)" in md
-    assert "### 🤖 #1 · " in md
+    assert "### E1 · 🤖 #1 · " in md
     assert warnings == [
         "Log anomaly: exec #7 `curl lost` typed at 09:05:01 has no markers in the log (missing).",
         "Manual entries no verdict cites: #2 (`ls`).",
@@ -478,7 +538,6 @@ def test_cited_missing_exec(tmp_path):
     ])
     v = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [1, 2]}]}
     model = _model(d, v)
-    assert model.tests[0].citations[1] == report.MissingCitation(2)
     assert [c.entry.id for c in model.tests[0].evidence] == [1]
     _, warnings = report.render_report(d, v)
     assert warnings == [
@@ -533,7 +592,7 @@ def _poll_verdicts(evidence):
 
 
 POLL_BLOCK = [
-    "### 🤖 #2–#5 · " + report._time(1010.0) + " · polled 3× over 41 s until /PROCESSED/ (matched)",
+    "### E1 · 🤖 #2–#5 · " + report._time(1010.0) + " · polled 3× over 41 s until /PROCESSED/ (matched)",
     "```",
     f"$ {GET}",
     "[attempt 1 · " + report._time(1010.0) + "]",
@@ -558,13 +617,13 @@ def test_cited_poll_folds_into_one_block(poll_dir, evidence):
 def test_titled_poll_citation(poll_dir):
     path, _ = report.render_report(poll_dir, _poll_verdicts([{"poll": 1, "title": "Batch reaches PROCESSED"}]))
     md = path.read_text()
-    assert "### Batch reaches PROCESSED\n" in md
+    assert "### E1: Batch reaches PROCESSED\n" in md
 
 
 def test_attempt_with_line_range_is_not_folded(poll_dir):
     path, _ = report.render_report(poll_dir, _poll_verdicts([{"entry": 3, "lines": "1"}]))
     md = path.read_text()
-    assert "polled" not in md and "### 🤖 #3 · " in md
+    assert "polled" not in md and "### E1 · 🤖 #3 · " in md
 
 
 def test_unknown_poll_is_warned(poll_dir):
@@ -584,7 +643,7 @@ def test_single_attempt_poll(tmp_path):
     d = make_dir(tmp_path, log, [{"id": 1, "command": GET, "poll_id": 1}],
                  [{"poll_id": 1, "command": GET, "until": "PROCESSED", "attempts": [1], "outcome": "matched"}])
     md = report.render_report(d, _poll_verdicts([1]))[0].read_text()
-    assert "### 🤖 #1 · " in md and "polled 1× over 0 s" in md and md.count("[attempt") == 1
+    assert "### E1 · 🤖 #1 · " in md and "polled 1× over 0 s" in md and md.count("[attempt") == 1
 
 
 def test_poll_index_is_covered_by_the_hash(poll_dir):

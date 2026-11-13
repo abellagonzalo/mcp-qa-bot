@@ -74,12 +74,13 @@ class MissingCitation:
 
 @dataclass(frozen=True)
 class Check:
-    """One row of a test's checks table: what was checked, expected vs actual, and whether it held."""
+    """One checked fact: what was checked, expected vs actual, whether it held, and its proof."""
 
     check: str
     expected: str
     actual: str
     ok: bool | None  # None: not judged (skipped test, or warned about)
+    evidence: tuple[int, ...] = ()  # 0-based indexes into the test's ``evidence`` citations
 
 
 @dataclass
@@ -93,12 +94,16 @@ class TestCase:
     expected: str
     actual: str
     note: str
-    citations: list[Citation | PollCitation | MissingCitation]
+    citations: list[Citation | PollCitation]  # what the log backs; numbered E1, E2 … in the report
     checks: list[Check] = field(default_factory=list)
+    requirement: str = ""
+    preconditions: list[str] = field(default_factory=list)
+    test_data: list[str] = field(default_factory=list)
+    steps: list[str] = field(default_factory=list)
 
     @property
     def evidence(self) -> list[Citation | PollCitation]:
-        return [c for c in self.citations if not isinstance(c, MissingCitation)]
+        return self.citations
 
     @property
     def cited_ids(self) -> set[int]:
@@ -233,8 +238,34 @@ def _resolve_citation(
     return Citation(entry, (start, end))
 
 
-def _parse_checks(raw, tid: str, verdict: str, warnings: list[str]) -> list[Check]:
-    """The optional ``checks`` list: ``[{"check", "expected", "actual", "ok"}]``."""
+def _check_evidence(
+    refs, name: str, n_items: int, cited: dict[int, int], tid: str, warnings: list[str]
+) -> tuple[int, ...]:
+    """A check's ``evidence``: 1-based positions in the test's ``evidence`` list, as citation indexes.
+
+    ``cited`` maps a position to the citation it became; a position whose item was
+    rejected (already warned about) is dropped quietly.
+    """
+    if refs is None:
+        return ()
+    if _is_int(refs):
+        refs = [refs]
+    if not isinstance(refs, list) or not all(_is_int(r) for r in refs):
+        warnings.append(f"{tid}: check '{name}' evidence must be positions in the test's evidence list, like [1, 2].")
+        return ()
+    out: list[int] = []
+    for r in refs:
+        if not 1 <= r <= n_items:
+            warnings.append(f"{tid}: check '{name}' cites E{r}, which is not in the test's evidence list.")
+        elif r - 1 in cited and cited[r - 1] not in out:
+            out.append(cited[r - 1])
+    return tuple(out)
+
+
+def _parse_checks(
+    raw, tid: str, verdict: str, n_items: int, cited: dict[int, int], warnings: list[str]
+) -> list[Check]:
+    """The optional ``checks`` list: ``[{"check", "expected", "actual", "ok", "evidence"}]``."""
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -256,13 +287,34 @@ def _parse_checks(raw, tid: str, verdict: str, warnings: list[str]) -> list[Chec
                 warnings.append(f"{tid}: check '{name}' is missing 'actual'.")
             if not isinstance(ok, bool):
                 warnings.append(f"{tid}: check '{name}' needs 'ok': true or false.")
-        checks.append(Check(name, expected, actual, ok if isinstance(ok, bool) else None))
+        refs = _check_evidence(item.get("evidence"), name, n_items, cited, tid, warnings)
+        if verdict in ("pass", "fail") and "evidence" not in item:
+            warnings.append(f"{tid}: check '{name}' links no evidence (add \"evidence\": [n]).")
+        checks.append(Check(name, expected, actual, ok if isinstance(ok, bool) else None, refs))
     judged = [c.ok for c in checks if c.ok is not None]
     if verdict == "pass" and False in judged:
         warnings.append(f"{tid}: verdict is pass but a check failed.")
     if verdict == "fail" and judged and all(judged):
         warnings.append(f"{tid}: verdict is fail but every check passed.")
     return checks
+
+
+def _parse_items(raw, tid: str, key: str, warnings: list[str]) -> list[str]:
+    """An optional list of one-line inline-markdown strings (``steps``, ``preconditions`` …)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        warnings.append(f"{tid}: '{key}' must be a list of strings.")
+        return []
+    out = []
+    for n, item in enumerate(raw, 1):
+        if not isinstance(item, str) or not item.strip():
+            warnings.append(f"{tid}: {key} item {n} must be a non-empty string.")
+            continue
+        out.append(" ".join(item.split()))
+    return out
 
 
 def _parse_findings(raw, warnings: list[str]) -> list[str]:
@@ -314,11 +366,6 @@ def parse_verdicts(verdicts: dict, rec: Record) -> Verdicts:
         if verdict not in VERDICT_ICONS:
             warnings.append(f"{tid}: verdict '{test.get('verdict')}' must be pass, fail or skipped.")
         expected, actual = _text(test.get("expected")), _text(test.get("actual"))
-        checks = _parse_checks(test.get("checks"), tid, verdict, warnings)
-        if verdict in ("pass", "fail") and not expected and not checks:
-            warnings.append(f"{tid}: missing 'expected' (or 'checks').")
-        if verdict == "fail" and not actual and not checks:
-            warnings.append(f"{tid}: a failed test needs 'actual' (or 'checks').")
 
         items = test.get("evidence")
         if items is None:
@@ -326,16 +373,25 @@ def parse_verdicts(verdicts: dict, rec: Record) -> Verdicts:
         elif not isinstance(items, list):
             warnings.append(f"{tid}: 'evidence' must be a list.")
             items = []
-        cits: list[Citation | PollCitation | MissingCitation] = []
-        seen_polls: set[int] = set()
-        for item in items:
+        cits: list[Citation | PollCitation] = []
+        cited: dict[int, int] = {}  # position in ``items`` -> index in ``cits``
+        polls_at: dict[int, int] = {}  # poll id -> index in ``cits``
+        for pos, item in enumerate(items):
             c = _parse_citation(item, rec, missing_ids, tid, warnings)
-            if isinstance(c, PollCitation):
-                if c.group.poll_id in seen_polls:
-                    continue  # several attempts of one poll cited: one block
-                seen_polls.add(c.group.poll_id)
-            if c is not None:
+            if isinstance(c, PollCitation) and c.group.poll_id in polls_at:
+                cited[pos] = polls_at[c.group.poll_id]  # several attempts of one poll cited: one block
+                continue
+            if isinstance(c, (Citation, PollCitation)):
+                if isinstance(c, PollCitation):
+                    polls_at[c.group.poll_id] = len(cits)
+                cited[pos] = len(cits)
                 cits.append(c)
+
+        checks = _parse_checks(test.get("checks"), tid, verdict, len(items), cited, warnings)
+        if verdict in ("pass", "fail") and not expected and not checks:
+            warnings.append(f"{tid}: missing 'expected' (or 'checks').")
+        if verdict == "fail" and not actual and not checks:
+            warnings.append(f"{tid}: a failed test needs 'actual' (or 'checks').")
         case = TestCase(
             id=tid,
             goal=goal,
@@ -346,6 +402,10 @@ def parse_verdicts(verdicts: dict, rec: Record) -> Verdicts:
             note=_text(test.get("note")),
             citations=cits,
             checks=checks,
+            requirement=_text(test.get("requirement")),
+            preconditions=_parse_items(test.get("preconditions"), tid, "preconditions", warnings),
+            test_data=_parse_items(test.get("test_data"), tid, "test_data", warnings),
+            steps=_parse_items(test.get("steps"), tid, "steps", warnings),
         )
         if not case.evidence and verdict != "skipped":
             warnings.append(f"{tid}: cites no log entries.")
@@ -502,16 +562,63 @@ def _link_text(text: str) -> str:
 CHECK_ICONS = {True: "✅", False: "❌", None: "—"}
 
 
-def _cell(text: str) -> str:
-    return " ".join(text.split()).replace("|", "\\|") or "—"
+def _inline(text: str) -> str:
+    return " ".join(text.split()) or "—"
 
 
-def _checks_table(checks: list[Check]) -> list[str]:
-    out = ["| Check | Expected | Actual | |", "|---|---|---|---|"]
-    out += [
-        f"| {_cell(c.check)} | {_cell(c.expected)} | {_cell(c.actual)} | {CHECK_ICONS[c.ok]} |"
-        for c in checks
-    ]
+def _section(label: str, items: list[str], numbered: bool = True) -> list[str]:
+    """A bold label and a list; empty when there are no items."""
+    if not items:
+        return []
+    return [f"**{label}**", "", *(f"{n}. {i}" if numbered else f"- {i}" for n, i in enumerate(items, 1)), ""]
+
+
+def _indent(lines: list[str], width: int) -> list[str]:
+    """Nest lines under a list item: content indented to the item's text column."""
+    pad = " " * width
+    return [pad + line if line else "" for line in lines]
+
+
+def _inline_evidence(test: TestCase) -> dict[int, int]:
+    """Citation index -> the failed check (index) whose item shows that evidence inline.
+
+    A citation backing a failed check is shown under the first failed check that cites
+    it, so the broken fact sits next to its proof; all other evidence goes in the test's
+    Evidence section.
+    """
+    out: dict[int, int] = {}
+    for n, check in enumerate(test.checks):
+        if check.ok is False:
+            for k in check.evidence:
+                out.setdefault(k, n)
+    return out
+
+
+def _check_lists(
+    test: TestCase, anchor: str, blocks: evidence.Renderer, inline: dict[int, int]
+) -> list[str]:
+    """Numbered Expected result and Actual result lists; Actual items link their evidence."""
+    out = _section("Expected result", [f"{_inline(c.check)}: {_inline(c.expected)}" for c in test.checks])
+    if not any(c.actual or c.ok is not None for c in test.checks):
+        return out  # not run (skipped): nothing to report as actual
+    out += ["**Actual result**", ""]
+    for n, c in enumerate(test.checks):
+        item = f"{CHECK_ICONS[c.ok]} {_inline(c.check)}: {_inline(c.actual)}"
+        if c.ok is False:
+            item += f" (expected {_inline(c.expected)})"
+        links = [f"[E{k + 1}](#{anchor}-{k + 1})" for k in c.evidence if inline.get(k) != n]
+        if links:
+            item += f" ({', '.join(links)})"
+        prefix = f"{n + 1}. "
+        out.append(prefix + item)
+        for k in c.evidence:
+            if inline.get(k) == n:
+                block = _evidence_block(test.evidence[k], blocks, test.id, k + 1, f"{anchor}-{k + 1}", inline=True)
+                out += ["", *_indent(block, len(prefix))]
+        if any(inline.get(k) == n for k in c.evidence):
+            out.append("")
+    if out[-1] != "":
+        out.append("")
     return out
 
 
@@ -526,16 +633,31 @@ def _contents(tests, anchors: _Anchors) -> list[str]:
 
 
 def _evidence_block(
-    c: Citation | PollCitation, blocks: evidence.Renderer, test_id: str, k: int, anchor: str
+    c: Citation | PollCitation,
+    blocks: evidence.Renderer,
+    test_id: str,
+    k: int,
+    anchor: str,
+    inline: bool = False,
 ) -> list[str]:
-    """One evidence block: heading and flags, then the cited lines as ``blocks`` renders them."""
+    """Evidence ``E<k>``: label, title and flags, then the cited lines as ``blocks`` renders them.
+
+    ``inline`` blocks sit under a failed check's list item, so they get a bold label
+    instead of a heading.
+    """
     head, body = _evidence_body(c)
     meta = " · ".join(head)
-    out = [f'<a id="{anchor}"></a>', ""]
-    out += [f"### {c.title}", f"{meta}  "] if c.title else [f"### {meta}"]
+    label = f"E{k}: {c.title}" if c.title else f"E{k}"
+    if inline:
+        first = f'<a id="{anchor}"></a>**{label}**'
+        out = [f"{first}  ", f"{meta}  "] if c.title else [f"{first} · {meta}  "]
+    else:
+        out = [f'<a id="{anchor}"></a>', ""]
+        out += [f"### {label}", f"{meta}  "] if c.title else [f"### {label} · {meta}"]
     out += [f"> ⚠️ {flag}" for flag in _flags(c)]
     out += blocks.block(test_id, k, _alt(c), body)
-    out.append("")
+    if not inline:
+        out.append("")
     return out
 
 
@@ -554,11 +676,20 @@ def render(
         cits = test.evidence
         a = anchors.test(i, test.id)
         icon = VERDICT_ICONS.get(test.verdict, "❔ " + test.verdict)
-        sections += [f'<a id="{a}"></a>', "", f"## {test.id}: {test.goal} — {icon}"]
-        fields = [("Input", test.input), ("Expected", test.expected), ("Actual", test.actual)]
-        sections += [f"**{label}:** {value}  " for label, value in fields if value]
+        sections += [f'<a id="{a}"></a>', "", f"## {test.id}: {test.goal} — {icon}", ""]
+        fields = [("Requirement", test.requirement), ("Input", test.input)]
+        lines = [f"**{label}:** {value}  " for label, value in fields if value]
+        sections += [*lines, ""] if lines else []
+        sections += _section("Pre-conditions", test.preconditions)
+        sections += _section("Test data", test.test_data, numbered=False)
+        sections += _section("Steps", test.steps)
+        inline = _inline_evidence(test)
         if test.checks:
-            sections += ["", *_checks_table(test.checks), ""]
+            sections += _check_lists(test, a, blocks, inline)
+        if test.expected:
+            sections += ["**Expected result**", "", test.expected, ""]
+        if test.actual:
+            sections += ["**Actual result**", "", test.actual, ""]
         if test.note:
             sections.append(f"**Note:** {test.note}  ")
         if cits:
@@ -571,9 +702,13 @@ def render(
             if manual:
                 listed = ", ".join(f"#{e.id} ({_table_code(e.command, 50)})" for e in manual)
                 sections.append(f"👤 Manual entries during this test: {listed}  ")
-        sections.append("")
-        for k, c in enumerate(cits, 1):
-            sections += _evidence_block(c, blocks, test.id, k, f"{a}-{k}")
+        if sections[-1] != "":
+            sections.append("")
+        rest = [(k, c) for k, c in enumerate(cits) if k not in inline]
+        if rest:
+            sections += ["**Evidence**", ""]
+        for k, c in rest:
+            sections += _evidence_block(c, blocks, test.id, k + 1, f"{a}-{k + 1}")
 
     warnings = model.warnings + blocks.warnings + log_anomalies(rec, model.tests)
 

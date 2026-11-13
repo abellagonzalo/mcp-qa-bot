@@ -336,13 +336,20 @@ for long output.
   "build": "payments@a1b2c3d",
   "tests": [{
     "id": "T1",
-    "goal": "Duplicate idempotency key is rejected",
-    "input": "`POST /v1/transfers` with `inputs/t1.json` twice, key `qa-pay123-t1`",
+    "goal": "Reusing an idempotency key is rejected with 409",
+    "requirement": "PAY-123",
     "verdict": "fail",
+    "preconditions": ["No transfer exists for key `qa-pay123-t1`"],
+    "test_data": ["Body: `inputs/t1.json`", "Idempotency key: `qa-pay123-t1`"],
+    "steps": [
+      "Send `POST /v1/transfers` with the body and the key",
+      "Send the same request again",
+      "Count the rows in `transfers` for the key"
+    ],
     "checks": [
-      {"check": "1st POST", "expected": "`201`", "actual": "`201`", "ok": true},
-      {"check": "2nd POST, same key", "expected": "`409`", "actual": "`201`", "ok": false},
-      {"check": "Rows in `transfers`", "expected": "1", "actual": "2", "ok": false}
+      {"check": "1st POST", "expected": "`201`", "actual": "`201`", "ok": true, "evidence": [1]},
+      {"check": "2nd POST, same key", "expected": "`409`", "actual": "`201`", "ok": false, "evidence": [2]},
+      {"check": "Rows in `transfers`", "expected": "1", "actual": "2", "ok": false, "evidence": [3]}
     ],
     "evidence": [
       {"entry": 2, "title": "1st POST is accepted with 201"},
@@ -357,24 +364,35 @@ for long output.
 }
 ```
 
+- Each test reads as a test case a stranger could rerun: `goal` is the title (action +
+  condition = expected outcome), `requirement` the ticket or requirement it covers,
+  `preconditions` the exact state before the test, `test_data` the actual values used
+  (ids, users, keys, bodies, not descriptions of them), and `steps` the numbered actions,
+  one action each, with action verbs ("Send", "Read", "Run"), not "check" or "verify".
+  These are lists of one-line strings. `input` still works for older verdicts.
 - Each test lists what it verified as `checks`, one per observable fact (status code,
   each field, DB row, log line): `check` names it, `expected` and `actual` are the
-  values, `ok` is `true` or `false`. The report shows them as a table, so a reader sees
-  at once which fact broke. A `pass` has every check `ok`; a `fail` has at least one
-  that isn't. Free-text `expected`/`actual` still work for a test that isn't a list of
+  concrete values (`not null`, not "set"), `ok` is `true` or `false`, and `evidence`
+  lists the positions of its proof in the test's `evidence` list (`[1]` is the first
+  item, shown as E1). The report shows them as numbered Expected and Actual result
+  lists; each actual result links its evidence, and the proof of a failed check is
+  shown right under it. A `pass` has every check `ok`; a `fail` has at least one that
+  isn't. Free-text `expected`/`actual` still work for a test that isn't a list of
   facts.
 - `note` is one or two sentences of context for this test (why a retry, a deviation
   from the plan). Anything a reader should act on even though the test passed, such as
   a surprising behaviour, a risk or a gap in the ticket, goes in the top-level
   `findings` list instead, one sentence each; the report shows it near the top.
-- `input`, `expected`, `actual`, `note`, check cells and findings are inline markdown,
+- `input`, `expected`, `actual`, `note`, `requirement`, the items of `preconditions`,
+  `test_data` and `steps`, check fields and findings are inline markdown,
   rendered as written. Put endpoints, payloads, keys, ids, statuses, field values and timestamps in
   backticks (`POST /api/v1/batches/275/cancel`, `{"cancelledBy":"qa"}`,
   `status=CANCELLED`); use **bold** sparingly for the deciding fact. Keep each on one
   line: no lists, headings or code fences.
 - `evidence` items are an entry id (whole entry) or `{"entry": id, "lines": "a-b"}`.
   Give each one a `title`: what it shows, in plain words ("Cancel returns 200 with
-  status CANCELLED"), not the command. It becomes the block's heading.
+  status CANCELLED"), not the command. It becomes the block's heading, after its
+  E-number.
   For a poll, cite `{"poll": 1, "title": "…"}` or any attempt's entry id: the report
   shows the group as one block. Cite `{"entry": id, "lines": "a-b"}` to show only that attempt.
 - A failure states actual vs expected. It may point to a bug in the code or in the
