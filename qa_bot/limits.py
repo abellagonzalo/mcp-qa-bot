@@ -1,7 +1,11 @@
 """Hard limits on what ``exec`` may type into the pane.
 
-These checks run in code on every agent command, whatever the model decides. Manual
-commands typed by the human are not restricted, only recorded.
+These checks run in code on every agent command, whatever the model decides. Any
+executable may run; what is refused is shell constructs that hide or detach work
+(substitution, output redirection, background jobs), unexpected multi-line input,
+and destructive SQL. Which tools the agent *should* use is guidance, not enforcement
+(see ``tools.py``). Manual commands typed by the human are not restricted, only
+recorded.
 """
 
 from __future__ import annotations
@@ -9,22 +13,6 @@ from __future__ import annotations
 import os
 import re
 import shlex
-
-DEFAULT_ALLOWED = (
-    "kubectl",
-    "curl",
-    "psql",
-    "jq",
-    "grep",
-    "head",
-    "tail",
-    "wc",
-    "sort",
-    "uniq",
-    "echo",
-    "sleep",
-    "date",
-)
 
 CONTROL_OPERATORS = {"|", "||", "&&", ";", "|&", ";;"}
 BACKGROUND_OPERATOR = "&"
@@ -54,13 +42,6 @@ _SQL_WHERE = re.compile(r"\bwhere\b", re.I)
 
 class CommandNotAllowed(ValueError):
     pass
-
-
-def allowed_commands() -> set[str]:
-    raw = os.environ.get("QA_BOT_ALLOWED_COMMANDS")
-    if not raw:
-        return set(DEFAULT_ALLOWED)
-    return {c.strip() for c in raw.split(",") if c.strip()}
 
 
 def _continues(line: str) -> bool:
@@ -124,11 +105,9 @@ def _check_sql(text: str) -> None:
             raise CommandNotAllowed("UPDATE without WHERE is forbidden.")
 
 
-def validate_command(command: str, allowed: set[str]) -> None:
+def validate_command(command: str) -> None:
     """Raise CommandNotAllowed unless the command passes every hard limit.
 
-    - Every pipeline/chain segment must start with an allowlisted executable (aliases
-      count as executables; add them to the allowlist).
     - Command/process substitution, output redirection and background jobs (`&`,
       `nohup`, `disown`) are refused.
     - Multi-line commands are only allowed as '\\' line continuations and/or a single
@@ -176,10 +155,5 @@ def validate_command(command: str, allowed: set[str]) -> None:
         exe = os.path.basename(words[0])
         if exe in BACKGROUND_COMMANDS:
             raise CommandNotAllowed(f"'{exe}' is not allowed (background jobs).")
-        if exe not in allowed:
-            raise CommandNotAllowed(
-                f"'{exe}' is not in the allowlist ({', '.join(sorted(allowed))}). "
-                "Extend it with QA_BOT_ALLOWED_COMMANDS."
-            )
 
     _check_sql(shell_line + "\n" + heredoc_body)

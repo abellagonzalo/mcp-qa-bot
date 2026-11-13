@@ -15,13 +15,17 @@ contexts too, but never try to work around a refusal.
 
 ## 1. Understand (read-only)
 
+- Call `preferred_tools(dir)` with the planned session folder (e.g. `./qa/<ticket>-<date>`
+  in the repo) and plan with those tools: they say which command to use for HTTP, DB
+  reads, auth and cluster checks in this project. If none are configured, use what the
+  repo and the env clearly support, and say so in the plan.
 - Read the ticket or PR, the diff, and the service's code: endpoints, request
   shapes, feature flags, DB tables, and which process does any async work. The repo is
   the source of truth for endpoints.
 - Read the target env's config and check which build it is running, e.g.
   `kubectl get deploy <svc> -o jsonpath='{.spec.template.spec.containers[0].image}'`.
   If the change isn't deployed there, stop and tell the user.
-- Read-only commands only in this phase (`kubectl get`, `select`, `curl` GETs).
+- Read-only commands only in this phase (cluster reads, `select`, HTTP GETs).
 
 ## 2. Plan
 
@@ -32,8 +36,9 @@ the nearest existing behaviour. For each test, write:
 - **Input**: payload or file (save it as `<dir>/inputs/<test>.json`).
 - **Expected outcome**: concrete and checkable (status codes, row counts, log lines).
 - **Exact commands** it will run, with literal values: full URL, ids, payloads. No
-  `$VARS` the reader can't see, so a reviewer can read the command and rerun it. HTTP is
-  plain `curl`; SQL is `psql … <<'SQL' … SQL` or `psql -c '…'`.
+  `$VARS` the reader can't see, so a reviewer can read the command and rerun it. Use the
+  preferred tool for each job. The examples below use `curl`, `jq` and `psql`; apply
+  the same formatting to whichever tools the list names.
 - **Pretty-print JSON** so the output (and the report) is readable:
   - Body only: `curl -s … | jq .`
   - Body + status code: `curl -s -w '\n%{http_code}\n' … | jq -Rr 'fromjson? // .'`.
@@ -100,7 +105,7 @@ approval again. The user's own commands in the pane need no approval.
      `peek`, or ask.
    - **TIMEOUT**: `peek` to see progress; `interrupt` if it hangs. Never retry a
      dangerous command blindly.
-   - A refusal (allowlist, production, forbidden SQL): don't try to get around it.
+   - A refusal (hard limit, production, forbidden SQL): don't try to get around it.
      Report it and adjust the plan with the user.
 5. If the user runs commands in the pane, they are recorded as manual entries. You may
    cite them.

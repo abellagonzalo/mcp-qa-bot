@@ -16,7 +16,8 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
 
 | Tool | Does | Returns |
 |---|---|---|
-| `open_session(name, dir)` | Creates the session folder and tmux session (the user's own zsh), loads the hooks, starts recording | session id, `tmux attach` command, folder |
+| `preferred_tools(dir?)` | Reads the [preferred tools](#preferred-tools) for the project, for planning | merged Markdown list |
+| `open_session(name, dir)` | Creates the session folder and tmux session (the user's own zsh), loads the hooks, starts recording | session id, `tmux attach` command, folder, preferred tools |
 | `exec(command, timeout?)` | Types the command into the pane exactly as written and waits for the hooks to signal it finished | entry id `#N`, exit code, duration, numbered output; or `TIMEOUT` / `BUSY` |
 | `peek(lines?)` | Shows the pane's recent contents | text + `idle` / `running` / `typing` |
 | `interrupt()` | Sends Ctrl-C | state |
@@ -57,7 +58,9 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
 
 ## Hard limits (enforced on every `exec`)
 
-- Every pipeline or chain segment must start with an allowlisted executable or alias.
+- Any executable may run. There is no allowlist: the approval gate in the skill and the
+  production guard are the safety boundary. Which tools to use is guidance (see
+  [Preferred tools](#preferred-tools)).
 - Refused: `$(…)`, backticks, process substitution, output redirection (`2>&1` and
   `>/dev/null` are fine), background jobs (`&`, `nohup`, `disown`), and multi-line input
   other than `\` line continuations and a single heredoc.
@@ -70,6 +73,23 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
 
 Commands the human types are not restricted. They are recorded and shown in the
 report as manual entries.
+
+## Preferred tools
+
+A list of which command to use for which job, e.g. "HTTP to in-cluster services:
+`kubectl curl`, not plain `curl`". It is guidance for the agent, not enforcement.
+`preferred_tools` returns it for planning and `open_session` returns it again at
+session start.
+
+| Scope | File |
+|---|---|
+| System | `$XDG_CONFIG_HOME/qa-bot/tools.md` (default `~/.config/qa-bot/tools.md`) |
+| Project | the nearest `.qa-bot/tools.md` in the session folder or a parent folder (usually the repo root) |
+
+Both are free-form Markdown, one `## heading` per job. The project file extends the
+system file: a project section replaces the system section with the same heading
+(case-insensitive), and other project sections are added. Text before the first `##`
+is kept from both. See [`examples/tools.md`](examples/tools.md).
 
 ## Session folder
 
@@ -105,7 +125,6 @@ No macOS Automation or Screen Recording permissions are needed.
 
 | Env var                   | Default | Meaning |
 |---------------------------|---------|---------|
-| `QA_BOT_ALLOWED_COMMANDS` | `kubectl,curl,psql,jq,grep,head,tail,wc,sort,uniq,echo,sleep,date` | Executables/aliases `exec` may run |
 | `QA_BOT_PROD_PATTERN`     | `(?<![a-z0-9])(prod\|production\|prd)(?![a-z])` | Case-insensitive regex for production names |
 | `QA_BOT_DEFAULT_TIMEOUT`  | `60`    | Seconds `exec` waits for a command (max 1800) |
 | `QA_BOT_EXEC_MAX_LINES`   | `300`   | Trailing output lines `exec` returns to the agent |

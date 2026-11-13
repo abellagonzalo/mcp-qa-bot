@@ -5,10 +5,13 @@ Runs shell commands in a tmux pane a human can watch (and type in), records
 everything that runs there, and renders a report from verdicts it is given. It knows
 nothing about QA itself; the workflow lives in the QA skill (skills/manual-qa).
 
-Tools: open_session, exec, peek, interrupt, close_session, render_report.
+Tools: preferred_tools, open_session, exec, peek, interrupt, close_session, render_report.
+
+Preferred tools (guidance for the agent, not enforced): ~/.config/qa-bot/tools.md
+(system) merged with the nearest .qa-bot/tools.md at or above the session folder
+(project wins per ## section). See qa_bot/tools.py.
 
 Configuration (environment variables):
-  QA_BOT_ALLOWED_COMMANDS  comma-separated executables/aliases exec may run
   QA_BOT_PROD_PATTERN      regex for production names (refused before every exec)
   QA_BOT_DEFAULT_TIMEOUT   seconds exec waits for a command (default 60)
   QA_BOT_EXEC_MAX_LINES    output lines exec returns to the agent (default 300)
@@ -26,8 +29,8 @@ from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
-from qa_bot import report, safety
-from qa_bot.allowlist import CommandNotAllowed, allowed_commands, validate_command
+from qa_bot import report, safety, tools
+from qa_bot.limits import CommandNotAllowed, validate_command
 from qa_bot.session import Session, SessionError
 
 MAX_TIMEOUT = 1800.0
@@ -67,6 +70,24 @@ def _numbered(lines: list[str], max_lines: int) -> str:
 
 
 @mcp.tool()
+async def preferred_tools(dir: str | None = None) -> str:
+    """Which command to use for which job (HTTP, DB reads, auth checks, ...). Read it
+    while planning, before open_session.
+
+    Guidance, not enforcement: exec runs any command that passes its hard limits. The
+    list merges the system file (~/.config/qa-bot/tools.md) with the nearest
+    .qa-bot/tools.md at or above `dir`; a project ## section replaces the system one
+    with the same heading.
+
+    Args:
+        dir: The planned session folder, or any folder in the project (default: the
+            last session folder, else the server's working directory).
+    """
+    folder = dir or _last_dir or Path.cwd()
+    return (await asyncio.to_thread(tools.load, folder)).describe()
+
+
+@mcp.tool()
 async def open_session(name: str, dir: str) -> str:
     """Start a recorded QA session: a tmux session running the user's own zsh.
 
@@ -75,7 +96,8 @@ async def open_session(name: str, dir: str) -> str:
         dir: Report folder. session.log, the index, hash and qa-report.md go
             here; put test inputs in <dir>/inputs/. Use a fresh folder per session.
 
-    Returns the session id, the `tmux attach` command for the human, and the folder.
+    Returns the session id, the `tmux attach` command for the human, the folder, and
+    the preferred tools for this project.
     """
     global _session, _last_dir
     async with _lock:
@@ -87,7 +109,8 @@ async def open_session(name: str, dir: str) -> str:
             f"Session: {_session.name}\n"
             f"Watch / type along: {_session.attach_command}\n"
             f"Folder: {_session.dir}\n"
-            "Recording started."
+            "Recording started.\n\n"
+            + (await asyncio.to_thread(tools.load, _session.dir)).describe()
         )
 
 
@@ -99,13 +122,13 @@ async def exec_command(command: str, timeout: float | None = None) -> str:
     Split long commands over lines with trailing '\\' continuations; multi-line SQL goes
     in one heredoc, e.g. psql ... <<'SQL' / ... / SQL.
 
-    Refused (hard limits): executables not on the allowlist, $(...)/backticks, output
-    redirection (except 2>&1 and >/dev/null), background jobs (&, nohup, disown),
+    Any executable may run; prefer the tools from preferred_tools. Refused (hard
+    limits): $(...)/backticks, output redirection (except 2>&1 and >/dev/null), background jobs (&, nohup, disown),
     TRUNCATE/DROP, DELETE/UPDATE without WHERE, and anything while the command, the kube
     context or the pane's database env looks like production.
 
     Args:
-        command: Shell command (aliases are fine if they are on the allowlist).
+        command: Shell command (aliases and functions from the user's zsh work).
         timeout: Seconds to wait for the command to finish (default 60).
 
     Returns the log entry id (#N, cite it in verdicts), exit code, duration and the
@@ -115,7 +138,7 @@ async def exec_command(command: str, timeout: float | None = None) -> str:
     """
     async with _lock:
         session = _require_session()
-        validate_command(command, allowed_commands())
+        validate_command(command)
         pane_env = safety.read_pane_env(session.pane_env_path())
         kube = await asyncio.to_thread(safety.kube_context, pane_env)
         safety.check_not_production(command, pane_env, kube)
