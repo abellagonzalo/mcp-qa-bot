@@ -285,7 +285,7 @@ async def render_report(
             "evidence": [{"entry": 2, "title": "…"}, {"entry": 4, "lines": "1-3", "title": "…"},
             {"poll": 1, "title": "…"}]}]}
             Each evidence title says in plain words what the block shows (not the
-            command); it heads the block and its link in the report's contents.
+            command); it heads the block in the report.
             input, expected, actual and note are one-line inline markdown: put
             endpoints, payloads, keys, ids, statuses and values in `backticks`.
             An entry id that belongs to a poll group (or {"poll": n}) shows the whole

@@ -44,7 +44,7 @@ class Citation:
 
     entry: transcript.Entry
     lines: tuple[int, int] | None  # 1-based inclusive range, None = whole entry
-    title: str = ""  # what the evidence shows, in words; links and headings use it
+    title: str = ""  # what the evidence shows, in words; heads its block
 
 
     @property
@@ -436,19 +436,12 @@ def _link_text(text: str) -> str:
     return re.sub(r"([\\`*_\[\]<>|~])", r"\\\1", text)
 
 
-def _evidence_label(c: Citation | PollCitation, k: int) -> str:
-    """Contents line for one evidence block: its title, or ``Evidence k`` without one."""
-    return c.title or f"Evidence {k}"
-
-
 def _contents(tests, anchors: _Anchors) -> list[str]:
     out = ["## Contents", ""]
     for i, test in enumerate(tests):
         a = anchors.test(i, test.id)
         icon = VERDICT_ICONS.get(test.verdict, "❔ " + test.verdict)
         out.append(f"- [{_link_text(f'{test.id}: {test.goal}')}](#{a}) {icon}")
-        for k, c in enumerate(test.evidence, 1):
-            out.append(f"  - [{_link_text(_evidence_label(c, k))}](#{a}-{k})")
     out.append("")
     return out
 

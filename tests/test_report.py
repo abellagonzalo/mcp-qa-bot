@@ -163,19 +163,16 @@ class FakeDrawer:
         dest.write_bytes(b"\x89PNG stub")
 
 
-def test_contents_links_every_test_and_evidence_block(clean_dir):
+def test_contents_links_each_test_one_level_only(clean_dir):
     path, _ = report.render_report(clean_dir, CLEAN_VERDICTS)
     md = path.read_text()
     contents = md.split("## Contents\n\n", 1)[1].split("\n\n", 1)[0].splitlines()
-    assert contents[0] == "- [T1: g](#t1) ✅ pass"
-    assert contents[1] == "  - [Evidence 1](#t1-1)"
-    assert contents[2] == "  - [Evidence 2](#t1-2)"
-    for a in ("t1", "t1-1", "t1-2"):
-        assert f'<a id="{a}"></a>' in md
+    assert contents == ["- [T1: g](#t1) ✅ pass"]
+    assert '<a id="t1"></a>' in md
     assert md.index("## Contents") < md.index("## T1: g")
 
 
-def test_evidence_titles_name_the_contents_links_and_headings(clean_dir):
+def test_evidence_titles_head_their_blocks(clean_dir):
     verdicts = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [
         {"entry": 1, "title": "Context is staging"},
         {"entry": 2, "lines": "1", "title": "POST returns 201"},
@@ -183,9 +180,9 @@ def test_evidence_titles_name_the_contents_links_and_headings(clean_dir):
     path, warnings = report.render_report(clean_dir, verdicts)
     md = path.read_text()
     assert warnings == []
-    assert "  - [Context is staging](#t1-1)" in md
-    assert "  - [POST returns 201](#t1-2)" in md
-    assert '<a id="t1-2"></a>\n\n### POST returns 201\n🤖 #2 · ' in md
+    assert "### Context is staging\n🤖 #1 · " in md
+    assert "### POST returns 201\n🤖 #2 · " in md
+    assert "](#t1-" not in md
 
 
 def test_contents_anchors_are_unique_and_link_text_escaped(clean_dir):
@@ -197,7 +194,7 @@ def test_contents_anchors_are_unique_and_link_text_escaped(clean_dir):
     md = path.read_text()
     assert "- [T1: a \\[b\\]](#t1)" in md
     assert "- [t1: c](#t1_2)" in md
-    assert '<a id="t1_2-1"></a>' in md
+    assert '<a id="t1_2"></a>' in md
 
 
 @pytest.fixture
@@ -484,7 +481,6 @@ def test_cited_poll_folds_into_one_block(poll_dir, evidence):
 def test_titled_poll_citation(poll_dir):
     path, _ = report.render_report(poll_dir, _poll_verdicts([{"poll": 1, "title": "Batch reaches PROCESSED"}]))
     md = path.read_text()
-    assert "  - [Batch reaches PROCESSED](#t1-1)" in md
     assert "### Batch reaches PROCESSED\n" in md
 
 

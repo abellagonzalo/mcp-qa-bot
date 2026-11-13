@@ -357,8 +357,7 @@ for long output.
   line: no lists, headings or code fences.
 - `evidence` items are an entry id (whole entry) or `{"entry": id, "lines": "a-b"}`.
   Give each one a `title`: what it shows, in plain words ("Cancel returns 200 with
-  status CANCELLED"), not the command. It names the block's heading and its link in the
-  report's contents; without one the link reads "Evidence 1".
+  status CANCELLED"), not the command. It becomes the block's heading.
   For a poll, cite `{"poll": 1, "title": "…"}` or any attempt's entry id: the report
   shows the group as one block. Cite `{"entry": id, "lines": "a-b"}` to show only that attempt.
 - A failure states actual vs expected. It may point to a bug in the code or in the
