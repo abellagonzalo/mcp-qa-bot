@@ -76,8 +76,9 @@ candidate. Understanding is done when every behaviour has:
 
 ## 2. Plan
 
-Pick **3–5 tests**: the happy path, the riskiest edge case, and a regression check on
-the nearest existing behaviour.
+Pick as many tests as the behaviours from step 1 need; there is no fixed count. Cover
+at least the happy path, the riskiest edge case, and a regression check on the nearest
+existing behaviour.
 
 - **One representative input per test.** Leave combinations to unit and integration
   tests. Size inputs to the behaviour: big enough to cross a limit, no bigger.
