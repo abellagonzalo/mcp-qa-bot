@@ -35,10 +35,13 @@ the nearest existing behaviour. For each test, write:
 - **Goal**: one line.
 - **Input**: payload or file (save it as `<dir>/inputs/<test>.json`).
 - **Expected outcome**: concrete and checkable (status codes, row counts, log lines).
-- **Exact commands** it will run, with literal values: full URL, ids, payloads. No
-  `$VARS` the reader can't see, so a reviewer can read the command and rerun it. Use the
-  preferred tool for each job. The examples below use `curl`, `jq` and `psql`; apply
-  the same formatting to whichever tools the list names.
+- **Credentials needed**: the shell variables the test reads (e.g. `$TOKEN`, `$DB_URL`),
+  or "none".
+- **Exact commands** it will run, with literal values: full URL, ids, payloads,
+  idempotency keys, so a reviewer can read the command and rerun it. The only exception
+  is credentials, which are always shell variables (see [Credentials](#credentials)). No
+  other variables. Use the preferred tool for each job. The examples below use `curl`,
+  `jq` and `psql`; apply the same formatting to whichever tools the list names.
 - **Pretty-print JSON** so the output (and the report) is readable:
   - Body only: `curl -s … | jq .`
   - Body + status code: `curl -s -w '\n%{http_code}\n' … | jq -Rr 'fromjson? // .'`.
@@ -67,7 +70,7 @@ the nearest existing behaviour. For each test, write:
   explicitly.
 
   ```bash
-  psql postgresql://qa:qa@localhost:55432/payments <<'SQL'
+  psql "$DB_URL" <<'SQL'
   select id, amount, idempotency_key, state
     from transfers
    where idempotency_key = 'qa-pay123-t1-20261112';
@@ -78,10 +81,43 @@ the nearest existing behaviour. For each test, write:
 - Created entities get **unique ids / idempotency keys** (e.g. `qa-pay123-t1-<date>`)
   so reruns don't collide.
 
+Start the plan with a **Credentials needed** line that lists every variable across all
+tests (e.g. `Credentials needed: $TOKEN (backoffice token), $DB_URL (read-only DB URL)`),
+so the user knows what to load before approving.
+
+### Credentials
+
+Tokens, JWTs, passwords, API keys and DB credentials are **never typed literally**.
+Anything typed into the pane ends up in `session.log`, the index, the report and the
+evidence images. Reference credentials as shell variables (`$TOKEN`, `$JWT`, `$DB_URL`)
+and leave everything else literal.
+
+```bash
+curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  https://api.staging.example.com/v1/transfers/tr_qa_1 \
+  | jq .
+```
+
+- **Loading them into the pane**: by default the user loads them before the first test
+  (e.g. by typing `source <env file>` in the pane). When the user asks, you may run
+  `source <path>` yourself through `exec`: only the path is recorded, never the value.
+  Never load a credential in a way that puts its value in the command or its output
+  (`export TOKEN=eyJ…`, `cat <env file>`).
+- **Never print a credential**: no `echo $TOKEN`, `env`, `printenv`, `set -x`, or
+  `curl -v` with auth headers. To check that a variable is set, use a check that doesn't
+  print the value, e.g. `test -n "$TOKEN" && echo TOKEN set`.
+- Loop variables and other shell control flow are not values and are not covered by
+  this rule.
+
 ## 3. Danger review
 
 Label every command **read-only** or **dangerous**. For each dangerous one, say what it
 changes (rows, messages, external calls) and whether and how it can be undone.
+
+Any command that would print a credential (see [Credentials](#credentials)) is
+dangerous, even if it changes nothing. Avoid it: if you can't, say which secret it
+reveals and where it would end up (log, report, images).
 
 ## 4. Approval gate
 

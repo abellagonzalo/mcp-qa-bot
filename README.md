@@ -150,5 +150,7 @@ npx @modelcontextprotocol/inspector .venv/bin/python qa_server.py
 
 ## Not in scope yet
 
-- Hiding secrets in logs and reports.
+- Redacting secrets that leak through command *output* (e.g. a service echoing a token
+  back). Credentials in commands stay out of the log by a skill rule: they are always
+  shell variables (`$TOKEN`), never literals.
 - Browser-driven testing.
