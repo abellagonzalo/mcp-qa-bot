@@ -33,7 +33,7 @@ side effects).
 ### Tools
 
 Call `preferred_tools(dir)` with the planned session folder (e.g.
-`./qa/<ticket>-<date>` in the repo) and plan with those tools: they say which command
+`./qa/<ticket>-<YYYYMMDD>-<HHMM>` in the repo) and plan with those tools: they say which command
 to use for HTTP, DB reads, auth, cluster checks, tickets, PRs and deploys in this
 project. If none are configured for a job, use what the repo and the env clearly
 support, and say so in the plan.
@@ -294,8 +294,9 @@ approval again. The user's own commands in the pane need no approval.
 
 ## 5. Execute
 
-1. `open_session(name, dir)`: use e.g. `name="pay-123"` and a fresh folder like
-   `./qa/pay-123-<date>`. Give the user the `tmux attach` command it returns, then
+1. `open_session(name, dir)`: use e.g. `name="pay-123"` and a fresh folder named
+   with the date and the local hour and minute it starts, like
+   `./qa/pay-123-20261113-1909`, so reruns on the same day don't collide. Give the user the `tmux attach` command it returns, then
    **wait** until they say they've attached (or that they don't want to watch) before
    the first `exec`. Commands finish in milliseconds, so without this pause the whole
    run is over before anyone can attach.

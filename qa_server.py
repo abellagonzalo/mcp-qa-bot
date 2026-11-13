@@ -103,7 +103,9 @@ async def open_session(name: str, dir: str) -> str:
     Args:
         name: Session name (also the tmux session name), e.g. "pay-123".
         dir: Report folder. session.log, the index, hash and qa-report.md go
-            here; put test inputs in <dir>/inputs/. Use a fresh folder per session.
+            here; put test inputs in <dir>/inputs/. Use a fresh folder per session,
+            named <ticket>-<YYYYMMDD>-<HHMM> (local start time), e.g.
+            ./qa/pay-123-20261113-1909.
 
     Returns the session id, the `tmux attach` command for the human, the folder, and
     the preferred tools for this project.
