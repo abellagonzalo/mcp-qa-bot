@@ -134,11 +134,16 @@ for long output.
 - `evidence` items are an entry id (whole entry) or `{"entry": id, "lines": "a-b"}`.
 - A failure states actual vs expected. It may point to a bug in the code or in the
   ticket; say which you think it is in `note`.
-- Judge from the text output, never from screenshots.
+- Judge from the text output `exec` returns.
 
 ## 7. Report
 
 Call `render_report(verdicts)`. If it returns validation warnings, fix the verdicts
-and render again until it returns none. Then reply in chat with the report path, the
+and render again until it returns none.
+
+Evidence is text by default. When the user wants images (to paste into Jira,
+Confluence or a PR), pass `evidence="image"`, or `"both"` to keep the text in a
+collapsed block. Images are drawn from the cited lines, so cite tight line ranges: a
+warning flags any image over 60 lines. Then reply in chat with the report path, the
 pass/fail summary, any side effects left in the env (created rows, messages), and
 anything that needs a follow-up.

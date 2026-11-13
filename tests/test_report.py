@@ -1,9 +1,10 @@
 import json
+import shutil
 
 import pytest
 from logfake import end, entry, start
 
-from qa_bot import report, session
+from qa_bot import evidence, report, session
 
 
 def make_dir(tmp_path, log: bytes, execs: list[dict]):
@@ -111,3 +112,93 @@ def test_long_entry_cited_whole_is_capped(tmp_path, monkeypatch):
     md = path.read_text()
     assert "line 5\n" in md and "line 6\n" not in md
     assert "15 more lines not shown" in md
+
+
+# ------------------------------------------------------------------ image evidence
+
+
+@pytest.fixture
+def fake_freeze(monkeypatch):
+    """Replace freeze: record the lines each image is drawn from, write a stub PNG."""
+    drawn: dict[str, list[str]] = {}
+
+    def render_png(lines, dest):
+        drawn[dest.name] = list(lines)
+        dest.write_bytes(b"\x89PNG stub")
+
+    monkeypatch.setattr(evidence, "freeze_path", lambda: "/usr/bin/true")
+    monkeypatch.setattr(evidence, "render_png", render_png)
+    return drawn
+
+
+def test_image_evidence(qa_dir, fake_freeze):
+    path, warnings = report.render_report(qa_dir, VERDICTS, mode="image")
+    assert warnings == []
+    md = path.read_text()
+    assert "![#2](evidence/T1-1.png)" in md
+    assert "![#4](evidence/T1-2.png)" in md
+    assert "![#5 lines 1-3](evidence/T1-3.png)" in md
+    assert f"$ {POST}\n201\n" not in md  # no text blocks in image mode
+    assert "### 🤖 #2 · " in md  # headings stay text
+    assert "Images in evidence/ are rendered from the same lines" in md
+    assert sorted(p.name for p in (qa_dir / "evidence").iterdir()) == ["T1-1.png", "T1-2.png", "T1-3.png"]
+    # The image is drawn from exactly the lines the text block would show.
+    assert fake_freeze["T1-3.png"] == ["$ psql -c 'select count(*) from transfers'", " count", "-------", "     2"]
+    assert fake_freeze["T1-1.png"] == [f"$ {POST}", "201"]
+
+
+def test_both_evidence(qa_dir, fake_freeze):
+    md = report.render_report(qa_dir, VERDICTS, mode="both")[0].read_text()
+    assert "![#5 lines 1-3](evidence/T1-3.png)\n\n<details><summary>text</summary>\n\n```\n$ psql" in md
+    assert md.count("<details>") == 3
+
+
+def test_text_mode_writes_no_images(qa_dir, fake_freeze):
+    md = report.render_report(qa_dir, VERDICTS)[0].read_text()
+    assert "![" not in md and not (qa_dir / "evidence").exists() and fake_freeze == {}
+
+
+def test_rerender_removes_stale_images(qa_dir, fake_freeze):
+    report.render_report(qa_dir, VERDICTS, mode="image")
+    fewer = json.loads(json.dumps(VERDICTS))
+    fewer["tests"][0]["evidence"] = [2]
+    report.render_report(qa_dir, fewer, mode="image")
+    assert [p.name for p in (qa_dir / "evidence").iterdir()] == ["T1-1.png"]
+
+
+def test_duplicate_test_ids_do_not_overwrite_images(qa_dir, fake_freeze):
+    t = {"goal": "g", "expected": "e", "verdict": "pass"}
+    dup = {"tests": [{**t, "id": "T 1/a", "evidence": [2]}, {**t, "id": "T 1/a", "evidence": [4]}]}
+    md = report.render_report(qa_dir, dup, mode="image")[0].read_text()
+    assert "(evidence/T_1_a-1.png)" in md and "(evidence/T_1_a_2-1.png)" in md
+
+
+def test_tall_image_warns(tmp_path, fake_freeze, monkeypatch):
+    monkeypatch.setenv("QA_BOT_IMAGE_MAX_LINES", "3")
+    out = b"".join(b"line %d\r\n" % i for i in range(1, 6))
+    d = make_dir(tmp_path, entry(1, "kubectl logs x", out), [{"id": 1, "command": "kubectl logs x"}])
+    t = {"id": "T1", "goal": "g", "expected": "e", "verdict": "pass"}
+    _, warnings = report.render_report(d, {"tests": [{**t, "evidence": [1]}]}, mode="image")
+    assert any("T1: #1 shows 5 lines" in w for w in warnings)
+    _, warnings = report.render_report(d, {"tests": [{**t, "evidence": [{"entry": 1, "lines": "2-3"}]}]}, mode="image")
+    assert warnings == []
+
+
+def test_unknown_mode_is_rejected(qa_dir):
+    with pytest.raises(report.ReportError, match="evidence must be one of"):
+        report.render_report(qa_dir, VERDICTS, mode="png")
+
+
+def test_missing_freeze_fails_before_writing(qa_dir, monkeypatch):
+    monkeypatch.setattr(evidence.shutil, "which", lambda _: None)
+    with pytest.raises(evidence.EvidenceError, match="freeze"):
+        report.render_report(qa_dir, VERDICTS, mode="image")
+    assert not (qa_dir / report.REPORT_NAME).exists()
+    assert not (qa_dir / "verdicts.json").exists()
+
+
+@pytest.mark.skipif(not shutil.which("freeze"), reason="freeze not installed")
+def test_real_freeze_renders_png(qa_dir):
+    report.render_report(qa_dir, VERDICTS, mode="image")
+    png = (qa_dir / "evidence" / "T1-3.png").read_bytes()
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")

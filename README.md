@@ -9,7 +9,7 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
 
 | | Execution tool (this server) | QA skill (`skills/manual-qa`) |
 |---|---|---|
-| Owns | tmux session, running commands, detecting when they finish, the session log, rendering the report, screenshots, hard safety limits | understanding the change, planning tests, danger review, approval gate, verdicts |
+| Owns | tmux session, running commands, detecting when they finish, the session log, rendering the report (as text or images), hard safety limits | understanding the change, planning tests, danger review, approval gate, verdicts |
 | Guarantees | the log is complete and tamper-evident; report evidence is copied verbatim from the log; forbidden commands never run | the plan is approved before anything runs; every verdict cites log entries |
 
 ## Tools
@@ -17,11 +17,11 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
 | Tool | Does | Returns |
 |---|---|---|
 | `open_session(name, dir)` | Creates the session folder and tmux session (the user's own zsh), loads the hooks, starts recording | session id, `tmux attach` command, folder |
-| `exec(command, timeout?, screenshot?)` | Types the command into the pane exactly as written and waits for the hooks to signal it finished | entry id `#N`, exit code, duration, numbered output, screenshot path; or `TIMEOUT` / `BUSY` |
+| `exec(command, timeout?)` | Types the command into the pane exactly as written and waits for the hooks to signal it finished | entry id `#N`, exit code, duration, numbered output; or `TIMEOUT` / `BUSY` |
 | `peek(lines?)` | Shows the pane's recent contents | text + `idle` / `running` / `typing` |
 | `interrupt()` | Sends Ctrl-C | state |
 | `close_session(keep_tmux?)` | Stops recording, writes the exec index and the hashes | log path, entry count, sha256 |
-| `render_report(verdicts?, dir?)` | Checks integrity, validates verdicts against the closed log, renders `qa-report.md` | report path, validation warnings |
+| `render_report(verdicts?, dir?, evidence?)` | Checks integrity, validates verdicts against the closed log, renders `qa-report.md` with evidence as `text`, `image` or `both` | report path, validation warnings |
 
 ## How it works
 
@@ -42,6 +42,12 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
   the index), ⚠️ forged (inside another entry's output), ⚠️ missing (`exec` call with no
   markers). Entry output is cleaned deterministically: escape sequences are stripped
   and `\r` overwrites are replayed. Lines are numbered from 1 per entry.
+- Evidence is the cited lines (`$ command` + output, or just the cited range). With
+  `evidence="image"` the same lines are drawn as PNGs with `freeze` into `evidence/`,
+  for pasting into Jira, Confluence or a PR; `"both"` adds the text in a collapsed
+  `<details>`. Images are not pane screenshots: they are derived from the hashed log,
+  so they can always be regenerated and never disagree with it. Each render rebuilds
+  `evidence/`.
 
 ## Hard limits (enforced on every `exec`)
 
@@ -68,7 +74,7 @@ report as manual entries.
   session.log           # raw tmux transcript, markers included
   session.index.json    # exec calls: id, command, timestamp
   session.log.sha256    # sha256 of log + index (`shasum -a 256 -c session.log.sha256`)
-  shots/                # optional screenshots (<id>.png, rendered with freeze)
+  evidence/             # images of cited lines (<test>-<k>.png), only with evidence=image|both
   inputs/               # test inputs (payloads, CSVs)
 ```
 
@@ -76,7 +82,7 @@ report as manual entries.
 
 - macOS or Linux with **tmux ≥ 3.0** and **zsh ≥ 5.3**
 - Python ≥ 3.10; pinned to `mcp<2` (FastMCP was renamed in the 2.x SDK)
-- Optional: [`freeze`](https://github.com/charmbracelet/freeze) for screenshots
+- Optional: [`freeze`](https://github.com/charmbracelet/freeze) for image evidence
   (`brew install charmbracelet/tap/freeze`)
 
 No macOS Automation or Screen Recording permissions are needed.
@@ -98,6 +104,7 @@ No macOS Automation or Screen Recording permissions are needed.
 | `QA_BOT_DEFAULT_TIMEOUT`  | `60`    | Seconds `exec` waits for a command (max 1800) |
 | `QA_BOT_EXEC_MAX_LINES`   | `300`   | Trailing output lines `exec` returns to the agent |
 | `QA_BOT_REPORT_MAX_LINES` | `200`   | Lines shown when an entry is cited without a line range (a warning asks for a range) |
+| `QA_BOT_IMAGE_MAX_LINES`  | `60`    | Lines per evidence image before `render_report` warns (cite a narrower range) |
 | `QA_BOT_TMUX_SOCKET`      | –       | tmux socket name (`-L`); default is the user's normal tmux server |
 
 ## Claude Code integration

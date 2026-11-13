@@ -13,6 +13,7 @@ Configuration (environment variables):
   QA_BOT_DEFAULT_TIMEOUT   seconds exec waits for a command (default 60)
   QA_BOT_EXEC_MAX_LINES    output lines exec returns to the agent (default 300)
   QA_BOT_REPORT_MAX_LINES  lines shown when an entry is cited without a range (default 200)
+  QA_BOT_IMAGE_MAX_LINES   lines per evidence image before render_report warns (default 60)
   QA_BOT_TMUX_SOCKET       tmux socket name (-L); default: the user's default server
 """
 
@@ -21,8 +22,9 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from typing import Literal
 
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp import FastMCP
 
 from qa_bot import report, safety
 from qa_bot.allowlist import CommandNotAllowed, allowed_commands, validate_command
@@ -70,7 +72,7 @@ async def open_session(name: str, dir: str) -> str:
 
     Args:
         name: Session name (also the tmux session name), e.g. "pay-123".
-        dir: Report folder. session.log, the index, hash, shots/ and qa-report.md go
+        dir: Report folder. session.log, the index, hash and qa-report.md go
             here; put test inputs in <dir>/inputs/. Use a fresh folder per session.
 
     Returns the session id, the `tmux attach` command for the human, and the folder.
@@ -90,7 +92,7 @@ async def open_session(name: str, dir: str) -> str:
 
 
 @mcp.tool(name="exec")
-async def exec_command(command: str, timeout: float | None = None, screenshot: bool = False) -> list:
+async def exec_command(command: str, timeout: float | None = None) -> str:
     """Type a command into the session's pane exactly as written and wait until it finishes.
 
     Use literal values (full URL, ids, payloads) so the command itself is the proof.
@@ -105,7 +107,6 @@ async def exec_command(command: str, timeout: float | None = None, screenshot: b
     Args:
         command: Shell command (aliases are fine if they are on the allowlist).
         timeout: Seconds to wait for the command to finish (default 60).
-        screenshot: Also render the pane as <dir>/shots/<id>.png.
 
     Returns the log entry id (#N, cite it in verdicts), exit code, duration and the
     numbered output lines. TIMEOUT returns the partial output (the command keeps
@@ -121,30 +122,25 @@ async def exec_command(command: str, timeout: float | None = None, screenshot: b
 
         wait = _env_number("QA_BOT_DEFAULT_TIMEOUT", 60) if timeout is None else timeout
         wait = max(1.0, min(float(wait), MAX_TIMEOUT))
-        result = await asyncio.to_thread(session.exec, command, wait, screenshot)
+        result = await asyncio.to_thread(session.exec, command, wait)
 
     max_lines = int(_env_number("QA_BOT_EXEC_MAX_LINES", 300))
     if result.status == "BUSY":
-        return [
+        return (
             "BUSY: a command is running or the prompt is not empty (the human may be typing). "
             "Nothing was typed. Pane:\n" + "\n".join(result.output)
-        ]
+        )
     if result.entry_id is None:
-        return [
+        return (
             f"TIMEOUT after {wait:g}s: no start marker seen (hooks broken or input not accepted). "
             "Pane:\n" + "\n".join(result.output)
-        ]
+        )
     header = f"#{result.entry_id}"
     if result.status == "TIMEOUT":
         header = f"TIMEOUT after {wait:g}s · {header} still running (peek / interrupt)"
     else:
         header += f" · exit {result.exit_code} · {result.duration_ms} ms"
-    if result.screenshot:
-        header += f"\nScreenshot: {result.screenshot}"
-    content: list = [f"{header}\n{_numbered(result.output, max_lines)}"]
-    if result.screenshot:
-        content.append(Image(path=str(result.screenshot)))
-    return content
+    return f"{header}\n{_numbered(result.output, max_lines)}"
 
 
 @mcp.tool()
@@ -181,7 +177,11 @@ async def close_session(keep_tmux: bool = False) -> str:
 
 
 @mcp.tool()
-async def render_report(verdicts: dict | None = None, dir: str | None = None) -> str:
+async def render_report(
+    verdicts: dict | None = None,
+    dir: str | None = None,
+    evidence: Literal["text", "image", "both"] = "text",
+) -> str:
     """Validate verdicts against the closed log and render <dir>/qa-report.md.
 
     Args:
@@ -191,6 +191,10 @@ async def render_report(verdicts: dict | None = None, dir: str | None = None) ->
             "verdict": "pass|fail|skipped", "actual", "note",
             "evidence": [2, {"entry": 4, "lines": "1-3"}]}]}
         dir: Session folder (default: the last session opened).
+        evidence: How cited log lines appear in the report. "text": code blocks.
+            "image": PNGs rendered from the same lines into <dir>/evidence/ (needs
+            freeze), for pasting into Jira, Confluence or a PR. "both": the image,
+            then the text in a collapsed <details>.
 
     Fails if session.log or the index changed after close_session. Returns the report
     path and validation warnings; fix them and render again.
@@ -200,7 +204,7 @@ async def render_report(verdicts: dict | None = None, dir: str | None = None) ->
         raise SessionError("No session folder known; pass dir.")
     if _session is not None and not _session.closed and _session.dir == directory.resolve():
         raise SessionError("Close the session before rendering the report.")
-    path, warnings = await asyncio.to_thread(report.render_report, directory, verdicts)
+    path, warnings = await asyncio.to_thread(report.render_report, directory, verdicts, evidence)
     if not warnings:
         return f"Report: {path}\nNo validation warnings."
     return f"Report: {path}\nValidation warnings ({len(warnings)}):\n" + "\n".join(f"- {w}" for w in warnings)

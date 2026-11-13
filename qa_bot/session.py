@@ -34,7 +34,6 @@ HOOKS = Path(__file__).with_name("hooks.zsh")
 LOG_NAME = "session.log"
 INDEX_NAME = "session.index.json"
 HASH_NAME = "session.log.sha256"
-SHOTS_DIR = "shots"
 HANDSHAKE_TIMEOUT = 30.0
 FLUSH_GRACE = 2.0  # how long to wait for pipe-pane to deliver bytes after a signal
 
@@ -122,7 +121,6 @@ class ExecResult:
     exit_code: int | None = None
     duration_ms: int | None = None
     output: list[str] = field(default_factory=list)
-    screenshot: Path | None = None
 
 
 @dataclass
@@ -165,7 +163,6 @@ class Session:
             raise SessionError("zsh is not installed.")
 
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / SHOTS_DIR).mkdir(exist_ok=True)
         (directory / "inputs").mkdir(exist_ok=True)
         runtime = Path(tempfile.mkdtemp(prefix=f"mcp-qa-bot-{session_name}-"))
         channel = f"qa-bot-{session_name}-{secrets.token_hex(4)}"
@@ -245,7 +242,7 @@ class Session:
         tmux("paste-buffer", "-b", self.channel, "-d", "-p", "-t", self.target)
         tmux("send-keys", "-t", self.target, "Enter")
 
-    def exec(self, command: str, timeout: float, screenshot: bool = False) -> ExecResult:
+    def exec(self, command: str, timeout: float) -> ExecResult:
         if self.closed:
             raise SessionError("Session is closed.")
         state = self.state()
@@ -284,16 +281,13 @@ class Session:
 
         if entry is None:
             return ExecResult(status="TIMEOUT", output=self.peek(40).splitlines())
-        result = ExecResult(
+        return ExecResult(
             status="done" if entry.finished else "TIMEOUT",
             entry_id=entry.id,
             exit_code=entry.exit_code,
             duration_ms=entry.duration_ms,
             output=entry.lines,
         )
-        if screenshot:
-            result.screenshot = self.screenshot(entry.id)
-        return result
 
     def _find_entry(self, offset: int) -> transcript.Entry | None:
         """First top-level entry that started after ``offset`` in the log."""
@@ -302,23 +296,6 @@ class Session:
             data = fh.read()
         parsed = transcript.parse(data)
         return parsed.entries[0] if parsed.entries else None
-
-    # ----------------------------------------------------------- screenshot
-
-    def screenshot(self, entry_id: int) -> Path | None:
-        freeze = shutil.which("freeze")
-        if not freeze:
-            return None
-        dest = self.dir / SHOTS_DIR / f"{entry_id}.png"
-        pane = tmux("capture-pane", "-p", "-e", "-t", self.target)
-        result = subprocess.run(
-            [freeze, "--language", "ansi", "--window", "-o", str(dest)],
-            input=pane,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return dest if result.returncode == 0 and dest.exists() else None
 
 
 def _has_session(name: str) -> bool:

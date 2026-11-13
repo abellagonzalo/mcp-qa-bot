@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# QA session output from local runs (session logs, reports, screenshots, inputs)
+# QA session output from local runs (session logs, reports, evidence images, inputs)
 qa/
 
 # macOS

@@ -1,8 +1,9 @@
 """Validate ``verdicts.json`` against the closed log and render ``qa-report.md``.
 
 Everything above the ``###`` evidence blocks comes from the verdicts the agent wrote;
-the evidence blocks are copied verbatim from the cleaned log entries. The agent never
-writes evidence itself.
+the evidence blocks are copied verbatim from the cleaned log entries, as text, as images
+drawn from the same lines (``evidence.py``), or both. The agent never writes evidence
+itself.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from . import evidence
 from . import session as sess
 from . import transcript
 
@@ -166,7 +168,8 @@ def validate(verdicts: dict, t: transcript.Transcript, missing: list[dict]) -> t
 # ----------------------------------------------------------------- rendering
 
 
-def _evidence_block(c: Citation) -> list[str]:
+def _evidence_body(c: Citation) -> tuple[list[str], list[str], int]:
+    """Heading parts, ``$ command`` + shown output lines (+ truncation note), output line count."""
     e = c.entry
     head = [f"{SOURCE_ICONS.get(e.source, '❔')} #{e.id}", _time(e.started)]
     head.append(f"exit {e.exit_code}" if e.finished else "still running")
@@ -187,11 +190,30 @@ def _evidence_block(c: Citation) -> list[str]:
     body = [f"$ {cmd_lines[0]}", *cmd_lines[1:], *shown]
     if note:
         body.append(note)
-    fence = _fence(body)
+    return head, body, len(shown)
+
+
+def _evidence_block(c: Citation, mode: str = "text", image: Path | None = None) -> list[str]:
+    """One evidence block: heading, flags, then the cited lines as text, image or both.
+
+    Text and image are drawn from the same ``body`` lines, so they cannot disagree.
+    """
+    head, body, _ = _evidence_body(c)
     out = [f"### {' · '.join(head)}"]
-    for flag in e.flags:
+    for flag in c.entry.flags:
         out.append(f"> ⚠️ {flag}")
-    out += [fence, *body, fence, ""]
+    if mode in ("image", "both"):
+        if image is None:
+            raise ReportError("image evidence needs an image path.")
+        evidence.render_png(body, image)
+        alt = f"#{c.entry.id}" + (f" lines {c.lines[0]}-{c.lines[1]}" if c.lines else "")
+        out += [f"![{alt}]({evidence.EVIDENCE_DIR}/{image.name})", ""]
+    fence = _fence(body)
+    if mode == "text":
+        out += [fence, *body, fence]
+    elif mode == "both":
+        out += ["<details><summary>text</summary>", "", fence, *body, fence, "", "</details>"]
+    out.append("")
     return out
 
 
@@ -200,8 +222,28 @@ def render(
     t: transcript.Transcript,
     missing: list[dict],
     log_hash: str,
+    mode: str = "text",
+    directory: Path | None = None,
 ) -> tuple[str, list[str]]:
+    """Render the report markdown. ``mode`` is text, image or both; image modes write
+    PNGs into ``<directory>/evidence/``."""
+    if mode not in evidence.MODES:
+        raise ReportError(f"evidence must be one of {', '.join(evidence.MODES)}, not '{mode}'.")
+    images = mode in ("image", "both")
+    if images and directory is None:
+        raise ReportError("image evidence needs the session folder.")
     tests, citations, warnings = validate(verdicts, t, missing)
+    if images:
+        img_limit = evidence.max_image_lines()
+        for test, cits in zip(tests, citations):
+            tid = _text(test.get("id")) or "?"
+            for c in cits:
+                shown = _evidence_body(c)[2]
+                if shown > img_limit:
+                    warnings.append(
+                        f"{tid}: #{c.entry.id} shows {shown} lines; an image over {img_limit} lines "
+                        "is hard to read. Cite a narrower line range."
+                    )
 
     cited_by: dict[int, list[str]] = {}
     for test, cits in zip(tests, citations):
@@ -238,7 +280,8 @@ def render(
         out.append(f"| {_text(test.get('id'))} | {goal} | {icon} |")
     out.append("")
 
-    by_id = t.by_id()
+    image_dir = evidence.reset_dir(directory) if images else None
+    used_names: set[str] = set()
     for test, cits in zip(tests, citations):
         tid = _text(test.get("id"))
         verdict = _text(test.get("verdict")).lower()
@@ -262,8 +305,17 @@ def render(
                 listed = ", ".join(f"#{e.id} ({_table_code(e.command, 50)})" for e in manual)
                 out.append(f"👤 Manual entries during this test: {listed}  ")
         out.append("")
-        for c in cits:
-            out += _evidence_block(c)
+        for k, c in enumerate(cits, 1):
+            image = None
+            if images:
+                # Duplicate test ids (already warned about) must not overwrite each other's images.
+                name, n = evidence.file_name(tid, k), 1
+                while name in used_names:
+                    n += 1
+                    name = evidence.file_name(f"{tid}_{n}", k)
+                used_names.add(name)
+                image = image_dir / name
+            out += _evidence_block(c, mode, image)
 
     out += [
         "## Timeline",
@@ -292,14 +344,31 @@ def render(
     out += [
         "",
         f"<sub>Rendered by mcp-qa-bot. Evidence blocks are copied verbatim from {sess.LOG_NAME}; "
-        f"verify with `shasum -a 256 -c {sess.HASH_NAME}`.</sub>",
+        f"verify with `shasum -a 256 -c {sess.HASH_NAME}`."
+        + (
+            f" Images in {evidence.EVIDENCE_DIR}/ are rendered from the same lines and can be "
+            "regenerated with render_report."
+            if images
+            else ""
+        )
+        + "</sub>",
         "",
     ]
     return "\n".join(out), warnings
 
 
-def render_report(directory: Path, verdicts: dict | None = None) -> tuple[Path, list[str]]:
-    """Integrity check, validation and rendering; writes ``<directory>/qa-report.md``."""
+def render_report(
+    directory: Path, verdicts: dict | None = None, mode: str = "text"
+) -> tuple[Path, list[str]]:
+    """Integrity check, validation and rendering; writes ``<directory>/qa-report.md``.
+
+    ``mode`` is how cited lines appear: ``text`` (code blocks), ``image`` (PNGs in
+    ``evidence/``) or ``both``.
+    """
+    if mode not in evidence.MODES:
+        raise ReportError(f"evidence must be one of {', '.join(evidence.MODES)}, not '{mode}'.")
+    if mode != "text":
+        evidence.freeze_path()  # fail before writing anything
     directory = Path(directory).expanduser().resolve()
     log_hash = sess.verify_hash_file(directory)
 
@@ -317,7 +386,7 @@ def render_report(directory: Path, verdicts: dict | None = None) -> tuple[Path, 
     index = json.loads((directory / sess.INDEX_NAME).read_text()).get("execs", [])
     t = transcript.parse((directory / sess.LOG_NAME).read_bytes())
     missing = transcript.classify(t, index)
-    markdown, warnings = render(verdicts, t, missing, log_hash)
+    markdown, warnings = render(verdicts, t, missing, log_hash, mode, directory)
     report_path = directory / REPORT_NAME
     report_path.write_text(markdown)
     return report_path, warnings
