@@ -156,7 +156,11 @@ class Runtime:
             return "unknown"
 
     def last_done(self) -> int:
-        """Id of the last command whose end marker the hooks printed (0 if none)."""
+        """Id of the last command whose end marker the hooks printed (0 if none).
+
+        Written last in precmd, after the env and the idle state: once it reaches a
+        command's id, that command's env is published and the pane is idle.
+        """
         try:
             return int((self.dir / DONE_FILE).read_text().strip() or 0)
         except (OSError, ValueError):

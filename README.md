@@ -18,7 +18,7 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
 |---|---|---|
 | `preferred_tools(dir?)` | Reads the [preferred tools](#preferred-tools) for the project, for planning | merged Markdown list |
 | `open_session(name, dir)` | Creates the session folder and tmux session (the user's own zsh), loads the hooks, starts recording | session id, `tmux attach` command, folder, preferred tools |
-| `exec(command, timeout?)` | Types the command into the pane exactly as written and waits for the hooks to signal it finished | entry id `#N`, exit code, duration, numbered output; or `TIMEOUT` / `BUSY` |
+| `exec(command, timeout?)` | Types the command into the pane exactly as written and waits for the hooks to signal it finished | entry id `#N`, exit code, duration, numbered output; or `TIMEOUT` / `NO_START` / `BUSY` |
 | `poll(command, until, interval?, max_attempts?, timeout?)` | Runs the command like `exec`, once per attempt, `interval` s apart (default 20, max 10 attempts), until the output matches the `until` regex. Each attempt is its own entry; the attempts are recorded as one poll group | poll id `P<n>`, outcome (`matched` / `exhausted` / `busy` / `timeout` / `interrupted`), attempts, elapsed time, entry ids, last attempt's numbered output |
 | `peek(lines?)` | Shows the pane's recent contents | text + `idle` / `running` / `typing` |
 | `interrupt()` | Sends Ctrl-C | state |
@@ -41,7 +41,13 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
   parser, and the side-channel files (pane state, last finished id, pane env).
 - `exec` pastes the command with bracketed paste, so `;` and multi-line heredocs
   arrive exactly as written, then presses Enter. It returns `BUSY` without typing if a
-  command is running or the prompt line isn't empty (the human is typing).
+  command is running or the prompt line isn't empty (the human is typing), and
+  `NO_START` if the command was typed but the hooks never reported it starting.
+- `Session` only reaches the terminal through a small pane interface
+  ([`qa_bot/pane.py`](qa_bot/pane.py): type a line, send a key, capture, wait for the
+  hooks' signal). `TmuxPane` is the real adapter; the tests drive `Session`'s
+  completion logic (stale signals, the log lagging the signal, timeouts) against an
+  in-memory fake (`tests/panefake.py`) on a virtual clock.
 - `render_report` parses the log and classifies each marker pair against
   `session.index.json`: 🤖 agent (matches an `exec` call), 👤 manual (top level, not in
   the index), ⚠️ forged (inside another entry's output), ⚠️ missing (`exec` call with no
@@ -130,7 +136,7 @@ No macOS Automation or Screen Recording permissions are needed.
 ```bash
 /opt/homebrew/bin/python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest   # unit tests + a tmux/zsh integration test on a private socket
+.venv/bin/python -m pytest   # unit tests (fake pane) + tmux/zsh integration tests on a private socket
 ```
 
 ## Configuration

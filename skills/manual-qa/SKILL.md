@@ -308,11 +308,14 @@ approval again. The user's own commands in the pane need no approval.
      `peek`, or ask.
    - **TIMEOUT**: `peek` to see progress; `interrupt` if it hangs. Never retry a
      dangerous command blindly.
+   - **NO_START**: the command was typed but the shell never reported it starting.
+     `peek` to see what the pane shows; tell the user rather than retyping it.
    - A refusal (hard limit, production, forbidden SQL): don't try to get around it.
      Report it and adjust the plan with the user.
    - From `poll`: **exhausted** means the state wasn't reached in time, which is a
-     result: judge it, don't extend the poll on your own. **busy**, **timeout** or
-     **interrupted** stopped the poll early: find out why before polling again.
+     result: judge it, don't extend the poll on your own. **busy**, **timeout**,
+     **no_start** or **interrupted** stopped the poll early: find out why before
+     polling again.
 5. If the user runs commands in the pane, they are recorded as manual entries. You may
    cite them.
 6. `close_session(keep_tmux=true)` when done, so the user can still scroll the pane

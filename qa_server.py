@@ -142,7 +142,8 @@ async def exec_command(command: str, timeout: float | None = None) -> str:
 
     Returns the log entry id (#N, cite it in verdicts), exit code, duration and the
     numbered output lines. TIMEOUT returns the partial output (the command keeps
-    running: peek or interrupt). BUSY means a command is running or the human is
+    running: peek or interrupt). NO_START means the command was typed but the shell
+    hooks never reported it starting. BUSY means a command is running or the human is
     typing in the pane; nothing was typed.
     """
     async with _lock:
@@ -156,9 +157,10 @@ async def exec_command(command: str, timeout: float | None = None) -> str:
             "BUSY: a command is running or the prompt is not empty (the human may be typing). "
             "Nothing was typed. Pane:\n" + "\n".join(result.output)
         )
-    if result.entry_id is None:
+    if result.status == "NO_START":
         return (
-            f"TIMEOUT after {wait:g}s: no start marker seen (hooks broken or input not accepted). "
+            f"NO_START after {wait:g}s: the command was typed but no start marker was seen "
+            "(hooks broken or input not accepted). "
             "Pane:\n" + "\n".join(result.output)
         )
     header = f"#{result.entry_id}"
@@ -196,7 +198,8 @@ async def poll(
 
     Returns the outcome: matched, exhausted (no match after max_attempts), busy (the
     human is typing or a command is running; nothing more was typed), timeout (an
-    attempt is still running: peek or interrupt), or interrupted (Ctrl-C). Also the
+    attempt is still running: peek or interrupt), no_start (an attempt was typed but
+    never reported starting), or interrupted (Ctrl-C). Also the
     number of attempts, elapsed time, the entry ids and the last attempt's numbered
     output.
     """
@@ -223,8 +226,8 @@ async def poll(
         return header
     last = result.attempts[-1]
     max_lines = int(_env_number("QA_BOT_EXEC_MAX_LINES", 300))
-    if last.entry_id is None:
-        return f"{header}\nLast attempt: no start marker seen. Pane:\n" + "\n".join(last.output)
+    if last.status == "NO_START":
+        return f"{header}\nLast attempt: typed, but no start marker seen. Pane:\n" + "\n".join(last.output)
     if last.status == "TIMEOUT":
         detail = f"#{last.entry_id} still running after {wait:g}s (peek / interrupt)"
     else:

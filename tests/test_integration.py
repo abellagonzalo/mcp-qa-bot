@@ -39,9 +39,9 @@ def qa(tmp_path, monkeypatch):
 
 
 def human_types(s, text, enter=True):
-    session.tmux("send-keys", "-t", s.target, "-l", "--", text)
+    s.pane.send_text(text)
     if enter:
-        session.tmux("send-keys", "-t", s.target, "Enter")
+        s.pane.send_key("Enter")
 
 
 def wait_state(s, state, timeout=5):
@@ -87,7 +87,7 @@ def test_full_session(qa):
     human_types(qa, "echo half", enter=False)
     wait_state(qa, "typing")
     assert qa.exec("echo nope", timeout=5).status == "BUSY"
-    session.tmux("send-keys", "-t", qa.target, "C-u")
+    qa.pane.send_key("C-u")
     wait_state(qa, "idle")
 
     # Timeout leaves the command running; interrupt brings the pane back.

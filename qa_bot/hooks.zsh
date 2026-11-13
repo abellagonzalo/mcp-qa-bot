@@ -42,11 +42,12 @@ __qa_preexec() {
   printf '\e]777;qa;start;%d;%s;%s\a' $__qa_cur $EPOCHREALTIME "$cmd"
 }
 
+# Order matters: the env and the idle state are published before `done`, so once
+# Python sees `done` catch up with a command, the pane is already idle for the next one.
 __qa_precmd() {
-  local ec=$?
-  if (( __qa_cur )); then
-    printf '\e]777;qa;end;%d;%d;%s\a' $__qa_cur $ec $EPOCHREALTIME
-    print -rn -- $__qa_cur >| $__qa_rt/done
+  local ec=$? fin=$__qa_cur
+  if (( fin )); then
+    printf '\e]777;qa;end;%d;%d;%s\a' $fin $ec $EPOCHREALTIME
     __qa_cur=0
   fi
   local k
@@ -54,6 +55,7 @@ __qa_precmd() {
     print -r -- "$k=${(P)k}"
   done >| $__qa_rt/env
   __qa_set_state idle
+  (( fin )) && print -rn -- $fin >| $__qa_rt/done
   tmux wait-for -S $__qa_chan 2>/dev/null
 }
 
