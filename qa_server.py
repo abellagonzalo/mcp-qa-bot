@@ -283,6 +283,8 @@ async def render_report(
             {"ticket", "env", "build", "tests": [{"id", "goal", "input", "expected",
             "verdict": "pass|fail|skipped", "actual", "note",
             "evidence": [2, {"entry": 4, "lines": "1-3"}, {"poll": 1}]}]}
+            input, expected, actual and note are one-line inline markdown: put
+            endpoints, payloads, keys, ids, statuses and values in `backticks`.
             An entry id that belongs to a poll group (or {"poll": n}) shows the whole
             group as one block: first and last attempt. Cite {"entry": id, "lines": ...}
             to show just that attempt.

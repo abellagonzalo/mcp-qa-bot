@@ -336,16 +336,21 @@ for long output.
   "tests": [{
     "id": "T1",
     "goal": "Duplicate idempotency key is rejected",
-    "input": "inputs/t1.json",
-    "expected": "1st POST 201, 2nd POST 409, one row in transfers",
+    "input": "`POST /v1/transfers` with `inputs/t1.json` twice, key `qa-pay123-t1`",
+    "expected": "1st POST `201`, 2nd POST `409`, one row in `transfers`",
     "verdict": "fail",
-    "actual": "2nd POST returned 201; two rows created",
+    "actual": "2nd POST returned `201`; two rows created",
     "evidence": [2, {"entry": 4, "lines": "1-3"}, 5],
-    "note": "IdempotencyFilter is not registered on /v1/transfers (TransferController.kt:42)"
+    "note": "`IdempotencyFilter` is not registered on `/v1/transfers` (`TransferController.kt:42`)"
   }]
 }
 ```
 
+- `input`, `expected`, `actual` and `note` are inline markdown, rendered as written.
+  Put endpoints, payloads, keys, ids, statuses, field values and timestamps in
+  backticks (`POST /api/v1/batches/275/cancel`, `{"cancelledBy":"qa"}`,
+  `status=CANCELLED`); use **bold** sparingly for the deciding fact. Keep each on one
+  line: no lists, headings or code fences.
 - `evidence` items are an entry id (whole entry) or `{"entry": id, "lines": "a-b"}`.
   For a poll, cite `{"poll": 1}` or any attempt's entry id: the report shows the group
   as one block. Cite `{"entry": id, "lines": "a-b"}` to show only that attempt.
