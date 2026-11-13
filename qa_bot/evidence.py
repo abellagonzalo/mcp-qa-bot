@@ -38,6 +38,15 @@ def max_image_lines() -> int:
         return 60
 
 
+def image_scale() -> float:
+    """Pixels per point of evidence PNGs (``QA_BOT_IMAGE_SCALE``, default 1)."""
+    try:
+        scale = float(os.environ.get("QA_BOT_IMAGE_SCALE", "1"))
+    except ValueError:
+        return 1.0
+    return scale if 0 < scale <= 8 else 1.0
+
+
 class Drawer(Protocol):
     """Draws lines as a PNG. The only seam: the real ``freeze`` or a test fake."""
 
@@ -49,7 +58,19 @@ class Drawer(Protocol):
 
 
 class Freeze:
-    """Draws with the ``freeze`` binary."""
+    """Draws with the ``freeze`` binary: plain code block, no window frame.
+
+    freeze always rasterises PNGs at 4x and has no scale option, so the layout is drawn
+    at ``scale / 4`` of freeze's defaults (font 14, padding 20 40 20 20); the 4x
+    rasterisation then lands on ``scale``. The shrink is vector, so text stays sharp.
+    """
+
+    PNG_SCALE = 4
+    FONT_SIZE = 14
+    PADDING = (20, 40, 20, 20)
+
+    def __init__(self, scale: float | None = None):
+        self.scale = image_scale() if scale is None else scale
 
     def _path(self) -> str:
         path = shutil.which("freeze")
@@ -63,9 +84,18 @@ class Freeze:
     def check(self) -> None:
         self._path()
 
+    def args(self, dest: Path) -> list[str]:
+        k = self.scale / self.PNG_SCALE
+        padding = ",".join(f"{p * k:g}" for p in self.PADDING)
+        return [
+            self._path(), "--language", "text", "--wrap", str(WRAP),
+            "--font.size", f"{self.FONT_SIZE * k:g}", "--padding", padding,
+            "-o", str(dest),
+        ]
+
     def draw(self, lines: list[str], dest: Path) -> None:
         result = subprocess.run(
-            [self._path(), "--language", "text", "--window", "--wrap", str(WRAP), "-o", str(dest)],
+            self.args(dest),
             input="\n".join(lines) + "\n",
             capture_output=True,
             text=True,

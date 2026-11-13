@@ -1,5 +1,6 @@
 import json
 import shutil
+from pathlib import Path
 
 import pytest
 from logfake import end, entry, start
@@ -263,6 +264,35 @@ def test_freeze_missing_from_path_is_reported(monkeypatch):
     monkeypatch.setenv("PATH", "")
     with pytest.raises(evidence.EvidenceError, match="needs freeze"):
         evidence.Freeze().check()
+
+
+def test_freeze_draws_without_window_at_scale_1_by_default(monkeypatch):
+    monkeypatch.delenv("QA_BOT_IMAGE_SCALE", raising=False)
+    monkeypatch.setattr(evidence.shutil, "which", lambda name: "/bin/freeze")
+    args = evidence.Freeze().args(Path("x.png"))
+    assert "--window" not in args
+    assert args[args.index("--font.size") + 1] == "3.5"
+    assert args[args.index("--padding") + 1] == "5,10,5,5"
+
+
+def test_image_scale_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("QA_BOT_IMAGE_SCALE", "2")
+    assert evidence.Freeze().scale == 2
+    monkeypatch.setenv("QA_BOT_IMAGE_SCALE", "nope")
+    assert evidence.Freeze().scale == 1
+
+
+def _png_width(path):
+    return int.from_bytes(path.read_bytes()[16:20], "big")
+
+
+@pytest.mark.skipif(not shutil.which("freeze"), reason="freeze not installed")
+def test_real_freeze_honours_scale(tmp_path):
+    lines = ["$ echo hi", "hi"]
+    evidence.Freeze(scale=1).draw(lines, tmp_path / "one.png")
+    evidence.Freeze(scale=2).draw(lines, tmp_path / "two.png")
+    one, two = _png_width(tmp_path / "one.png"), _png_width(tmp_path / "two.png")
+    assert abs(two - 2 * one) <= 2
 
 
 @pytest.mark.skipif(not shutil.which("freeze"), reason="freeze not installed")

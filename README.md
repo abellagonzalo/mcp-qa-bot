@@ -148,6 +148,7 @@ No macOS Automation or Screen Recording permissions are needed.
 | `QA_BOT_EXEC_MAX_LINES`   | `300`   | Trailing output lines `exec` returns to the agent |
 | `QA_BOT_REPORT_MAX_LINES` | `200`   | Lines shown when an entry is cited without a line range (a warning asks for a range) |
 | `QA_BOT_IMAGE_MAX_LINES`  | `60`    | Lines per evidence image before `render_report` warns (cite a narrower range) |
+| `QA_BOT_IMAGE_SCALE`      | `1`     | Pixels per point of evidence images (`2` for retina-sharp, `4` is freeze's own default) |
 | `QA_BOT_TMUX_SOCKET`      | –       | tmux socket name (`-L`); default is the user's normal tmux server |
 
 ## Claude Code integration

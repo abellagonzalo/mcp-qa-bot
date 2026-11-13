@@ -17,6 +17,7 @@ Configuration (environment variables):
   QA_BOT_EXEC_MAX_LINES    output lines exec returns to the agent (default 300)
   QA_BOT_REPORT_MAX_LINES  lines shown when an entry is cited without a range (default 200)
   QA_BOT_IMAGE_MAX_LINES   lines per evidence image before render_report warns (default 60)
+  QA_BOT_IMAGE_SCALE       pixels per point of evidence images (default 1; freeze's own is 4)
   QA_BOT_TMUX_SOCKET       tmux socket name (-L); default: the user's default server
 """
 
