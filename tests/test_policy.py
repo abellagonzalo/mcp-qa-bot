@@ -2,7 +2,8 @@ import re
 
 import pytest
 
-from qa_bot.policy import Policy, Refused, read_pane_env
+from qa_bot.hooks import DB_ENV_KEYS
+from qa_bot.policy import Policy, Refused
 
 
 def no_kube(pane_env):
@@ -167,8 +168,7 @@ def test_prod_pattern_is_configurable(monkeypatch):
     Policy(kube_lookup=no_kube, prod_pattern=re.compile("x9")).check("curl https://api.prod.example", {})
 
 
-def test_read_pane_env(tmp_path):
-    f = tmp_path / "env"
-    f.write_text("PGHOST=db.staging\nPGSERVICE=\nKUBECONFIG=/a=b\njunk\n")
-    assert read_pane_env(f) == {"PGHOST": "db.staging", "KUBECONFIG": "/a=b"}
-    assert read_pane_env(tmp_path / "missing") == {}
+@pytest.mark.parametrize("key", DB_ENV_KEYS)
+def test_every_published_db_key_is_guarded(key):
+    with pytest.raises(Refused, match=key):
+        Policy(kube_lookup=no_kube).check("echo hi", {key: "payments.prod.rds"})

@@ -1,8 +1,9 @@
 # mcp-qa-bot shell hooks.
 #
-# Sourced once into the user's interactive zsh by open_session:
+# Sourced once into the user's interactive zsh by open_session; the line is built by
+# hooks.py (source_line), which owns this protocol on the Python side:
 #
-#   source hooks.zsh <runtime-dir> <wait-for-channel>
+#   source hooks.zsh <runtime-dir> <wait-for-channel> <env key>...
 #
 # Every command line (typed by the agent or by a human) is wrapped in two invisible
 # OSC sequences that travel through the pty together with the command's output:
@@ -13,12 +14,14 @@
 # Side channels (files in <runtime-dir>, never printed to the terminal):
 #   state  idle | running | typing   (what the pane is doing right now)
 #   done   id of the last finished command
-#   env    KEY=value lines of context-relevant env vars, refreshed at every prompt
+#   env    KEY=value lines for the env keys given on the source line, refreshed at
+#          every prompt
 #
 # After every command (and once right after sourcing, as the startup handshake) the
 # precmd hook signals `tmux wait-for -S <channel>`.
 
 typeset -g __qa_rt=$1 __qa_chan=$2
+typeset -ga __qa_env_keys=(${@:3})
 typeset -gi __qa_seq=0 __qa_cur=0
 typeset -g __qa_state=''
 zmodload zsh/datetime
@@ -46,15 +49,10 @@ __qa_precmd() {
     print -rn -- $__qa_cur >| $__qa_rt/done
     __qa_cur=0
   fi
-  {
-    print -r -- "KUBECONFIG=$KUBECONFIG"
-    print -r -- "PGHOST=$PGHOST"
-    print -r -- "PGDATABASE=$PGDATABASE"
-    print -r -- "PGSERVICE=$PGSERVICE"
-    print -r -- "PGSERVICEFILE=$PGSERVICEFILE"
-    print -r -- "DATABASE_URL=$DATABASE_URL"
-    print -r -- "PWD=$PWD"
-  } >| $__qa_rt/env
+  local k
+  for k in $__qa_env_keys; do
+    print -r -- "$k=${(P)k}"
+  done >| $__qa_rt/env
   __qa_set_state idle
   tmux wait-for -S $__qa_chan 2>/dev/null
 }

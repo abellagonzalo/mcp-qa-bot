@@ -1,15 +1,21 @@
-"""Helpers that build session.log bytes the way the zsh hooks + tty produce them."""
+"""Helpers that build session.log bytes the way the zsh hooks + tty produce them.
+
+Marker bytes come from the real encoder in ``qa_bot.hooks``; this file only adds what
+the tty does around them (echo, onlcr, zsh's prompt).
+"""
+
+from qa_bot import hooks
 
 PROMPT_SP = b"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m" + b" " * 119 + b"\r \r"
 PROMPT = b"\r\x1b[0m\x1b[27m\x1b[24m\x1b[J% \x1b[K\x1b[?2004h"
 
 
 def start(eid, cmd, t=1_700_000_000.0):
-    return b"\x1b]777;qa;start;%d;%.6f;%s\x07" % (eid, t, cmd.replace("\n", "\r\n").encode())
+    return hooks.encode_start(eid, t, cmd).replace(b"\n", b"\r\n")  # tty onlcr
 
 
 def end(eid, code=0, t=1_700_000_000.3):
-    return b"\x1b]777;qa;end;%d;%d;%.6f\x07" % (eid, code, t)
+    return hooks.encode_end(eid, code, t)
 
 
 def entry(eid, cmd, output: bytes, code=0, t=1_700_000_000.0, dur=0.312):

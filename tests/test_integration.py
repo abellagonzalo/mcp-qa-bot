@@ -74,9 +74,9 @@ def test_full_session(qa):
     # The human runs a command; it gets the next id and leaves a stale wait-for signal.
     human_types(qa, "e manual")
     deadline = time.monotonic() + 5
-    while qa.last_done() < 7 and time.monotonic() < deadline:
+    while qa.hooks.last_done() < 7 and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert qa.last_done() == 7
+    assert qa.hooks.last_done() == 7
 
     # Stale signal must not make exec return before its own command finished.
     t0 = time.monotonic()
@@ -169,7 +169,7 @@ def test_policy_sees_env_the_human_sets_in_the_pane(qa):
     human_types(qa, "export PGHOST=payments.prod.rds")
     wait_state(qa, "idle")
     deadline = time.monotonic() + 5  # the hooks publish the env at the next prompt
-    while "PGHOST" not in (qa.pane_env_path().read_text() if qa.pane_env_path().exists() else ""):
+    while "PGHOST" not in qa.hooks.env():
         assert time.monotonic() < deadline, "hooks never published PGHOST"
         time.sleep(0.05)
     with pytest.raises(Refused, match="PGHOST"):
@@ -180,3 +180,17 @@ def test_policy_sees_env_the_human_sets_in_the_pane(qa):
     qa.close()
     idx = json.loads((qa.dir / record.INDEX_NAME).read_text())["execs"]
     assert [e["command"] for e in idx] == ["echo before"]
+
+
+def test_hooks_publish_every_env_key_python_declares(qa):
+    from qa_bot import hooks
+
+    human_types(qa, "export PGSERVICEFILE=/tmp/pg_service.conf PGDATABASE=payments")
+    wait_state(qa, "idle")
+    deadline = time.monotonic() + 5
+    while "PGSERVICEFILE" not in qa.hooks.env():
+        assert time.monotonic() < deadline, "hooks never published PGSERVICEFILE"
+        time.sleep(0.05)
+    published = (qa.runtime / hooks.ENV_FILE).read_text().splitlines()
+    assert [line.split("=", 1)[0] for line in published] == list(hooks.ENV_KEYS)
+    assert qa.hooks.env()["PGDATABASE"] == "payments"

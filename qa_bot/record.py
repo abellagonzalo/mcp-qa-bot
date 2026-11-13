@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import transcript
+from . import hooks, transcript
 from .transcript import Entry, StrayMarker
 
 LOG_NAME = "session.log"
@@ -162,7 +162,7 @@ def _classify(entries: list[Entry], execs: list[dict]) -> list[MissingExec]:
             missing.append(MissingExec(eid if _is_int(eid) else None, command, _timestamp(rec.get("typed_at"))))
             continue
         matched.add(entry.id)
-        if transcript.normalise_command(entry.command) == transcript.normalise_command(command):
+        if hooks.normalise_command(entry.command) == hooks.normalise_command(command):
             entry.source = "agent"
         else:
             entry.source = "mismatch"

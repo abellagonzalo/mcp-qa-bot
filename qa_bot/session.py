@@ -1,9 +1,9 @@
 """One QA session = one tmux session running the user's interactive zsh, recorded.
 
 Mechanics:
-- ``open`` starts ``zsh -l`` in a detached tmux session, types ``source hooks.zsh``
-  and waits for the hooks' first ``tmux wait-for`` signal (the user's .zshrc has
-  finished loading and the hooks are active). Only then ``pipe-pane`` starts
+- ``open`` starts ``zsh -l`` in a detached tmux session, types the line from
+  ``hooks.source_line`` and waits for the hooks' first ``tmux wait-for`` signal (the
+  user's .zshrc has finished loading and the hooks are active). Only then ``pipe-pane`` starts
   streaming the pane into ``session.log``, so the ``source`` line is not recorded.
 - ``exec`` checks the command against the exec policy (``policy.py``; refusals raise
   ``Refused`` and nothing is typed), then pastes the command into the pane (bracketed paste, so ``;`` and heredocs
@@ -30,10 +30,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import record, transcript
-from .policy import Policy, read_pane_env
+from . import hooks, record, transcript
+from .policy import Policy
 
-HOOKS = Path(__file__).with_name("hooks.zsh")
 HANDSHAKE_TIMEOUT = 30.0
 FLUSH_GRACE = 2.0  # how long to wait for pipe-pane to deliver bytes after a signal
 
@@ -166,9 +165,7 @@ class Session:
             "-c", str(directory), *env_args, zsh, "-l",
         )
         try:
-            session._type_line(
-                f"source {shlex.quote(str(HOOKS))} {shlex.quote(str(runtime))} {shlex.quote(channel)}"
-            )
+            session._type_line(hooks.source_line(runtime, channel))
             if not wait_for(channel, HANDSHAKE_TIMEOUT):
                 raise SessionError(
                     f"The shell did not signal readiness within {HANDSHAKE_TIMEOUT:g}s "
@@ -197,21 +194,14 @@ class Session:
 
     # ---------------------------------------------------------------- state
 
+    @property
+    def hooks(self) -> hooks.Runtime:
+        """What the shell hooks publish about the pane (state, last finished id, env)."""
+        return hooks.Runtime(self.runtime)
+
     def state(self) -> str:
         """idle | running | typing (from the hooks)."""
-        try:
-            return (self.runtime / "state").read_text().strip() or "unknown"
-        except OSError:
-            return "unknown"
-
-    def last_done(self) -> int:
-        try:
-            return int((self.runtime / "done").read_text().strip() or 0)
-        except (OSError, ValueError):
-            return 0
-
-    def pane_env_path(self) -> Path:
-        return self.runtime / "env"
+        return self.hooks.state()
 
     def peek(self, lines: int = 40) -> str:
         text = tmux("capture-pane", "-p", "-J", "-t", self.target, "-S", f"-{max(1, lines)}")
@@ -233,7 +223,7 @@ class Session:
 
     def _check(self, command: str) -> None:
         """Refuse (``policy.Refused``) unless the policy allows the command in the pane's current context."""
-        self.policy.check(command, read_pane_env(self.pane_env_path()))
+        self.policy.check(command, self.hooks.env())
 
     def exec(self, command: str, timeout: float) -> ExecResult:
         """Check the command against the policy, type it, and wait until it finishes."""
@@ -264,7 +254,7 @@ class Session:
             entry = self._find_entry(offset)
             if entry is not None and record["id"] is None:
                 record["id"] = entry.id
-            if entry is not None and entry.finished and self.last_done() >= entry.id:
+            if entry is not None and entry.finished and self.hooks.last_done() >= entry.id:
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:

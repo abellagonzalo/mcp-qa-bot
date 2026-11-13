@@ -36,6 +36,9 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
   `ESC]777;qa;start;<id>;<epoch>;<command>BEL` … `ESC]777;qa;end;<id>;<exit>;<epoch>BEL`.
   Ids come from a counter in the shell, so agent and human commands share one sequence.
   `precmd` signals `tmux wait-for`, which is how `exec` knows a command finished.
+  [`qa_bot/hooks.py`](qa_bot/hooks.py) owns this protocol on the Python side: the
+  `source` line (including which env keys the hooks publish), the marker encoder and
+  parser, and the side-channel files (pane state, last finished id, pane env).
 - `exec` pastes the command with bracketed paste, so `;` and multi-line heredocs
   arrive exactly as written, then presses Enter. It returns `BUSY` without typing if a
   command is running or the prompt line isn't empty (the human is typing).
@@ -76,7 +79,8 @@ A refusal raises `Refused` with a reason, and nothing is typed or recorded.
   without `WHERE`.
 - Production guard, checked before every `exec` because a human can switch context
   mid-session. It refuses if the command, the pane's `KUBECONFIG` context, cluster or
-  server, or the pane's `PGHOST`, `PGDATABASE`, `PGSERVICE` or `DATABASE_URL` matches
+  server, or the pane's `PGHOST`, `PGDATABASE`, `PGSERVICE`, `PGSERVICEFILE` or
+  `DATABASE_URL` matches
   `QA_BOT_PROD_PATTERN`.
 
 Commands the human types are not restricted. They are recorded and shown in the

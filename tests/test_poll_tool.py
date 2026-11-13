@@ -64,6 +64,7 @@ def test_invalid_regex(fake):
 
 from pathlib import Path  # noqa: E402
 
+from qa_bot import hooks  # noqa: E402
 from qa_bot.session import Session  # noqa: E402
 
 
@@ -134,7 +135,7 @@ def test_poll_refusal_before_first_attempt_records_nothing(command):
     ],
 )
 def test_exec_refuses_before_typing(tmp_path, command, pane_env):
-    (tmp_path / "env").write_text(pane_env)
+    (tmp_path / hooks.ENV_FILE).write_text(pane_env)
     s = scripted([done(1)], runtime=tmp_path)
     with pytest.raises(Refused):
         s.exec(command, 5)
@@ -142,7 +143,7 @@ def test_exec_refuses_before_typing(tmp_path, command, pane_env):
 
 
 def test_exec_checks_the_live_pane_env(tmp_path):
-    env = tmp_path / "env"
+    env = tmp_path / hooks.ENV_FILE
     seen = []
     s = scripted([done(1), done(2)], Policy(kube_lookup=lambda e: seen.append(e) or {}), runtime=tmp_path)
     env.write_text("KUBECONFIG=/a\n")

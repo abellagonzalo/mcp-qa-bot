@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-MARKER = re.compile(rb"\x1b\]777;qa;(start|end);([^\x07\x1b]*)(?:\x07|\x1b\\)")
+from . import hooks
 
 # zsh PROMPT_SP: when the output lacks a trailing newline, zsh prints PROMPT_EOL_MARK
 # (default: bold reverse '%' or '#'), pads with spaces and returns with "\r \r". It is
@@ -74,68 +74,46 @@ class Transcript:
         return {e.id: e for e in self.entries}
 
 
-def _float(text: str) -> float:
-    try:
-        return float(text.replace(",", "."))
-    except ValueError:
-        return 0.0
-
-
-def normalise_command(cmd: str) -> str:
-    """Command text as it appears in markers: \\r\\n from the tty's onlcr becomes \\n."""
-    cmd = cmd.replace("\r\n", "\n").replace("\r", "\n")
-    return cmd.replace("\x07", "").replace("\x1b", "").strip()
-
-
 def parse(log: bytes) -> Transcript:
+    """Pair the hooks' markers (``hooks.scan``) into top-level entries.
+
+    A marker inside a running entry's output is forged (stray); so is an end marker
+    with no matching start.
+    """
     entries: list[Entry] = []
     stray: list[StrayMarker] = []
     current: Entry | None = None
 
-    for m in MARKER.finditer(log):
-        kind = m.group(1).decode()
-        payload = m.group(2).decode("utf-8", errors="replace")
-        if kind == "start":
-            parts = payload.split(";", 2)
-            sid = parts[0]
-            cmd = normalise_command(parts[2]) if len(parts) > 2 else ""
+    for m in hooks.scan(log):
+        if isinstance(m, hooks.Start):
             if current is not None:
                 stray.append(
-                    StrayMarker("start", sid, cmd, m.start(), current.id, "forged: inside another entry's output")
+                    StrayMarker("start", m.id, m.command, m.offset, current.id, "forged: inside another entry's output")
                 )
                 continue
-            if not sid.isdigit():
-                stray.append(StrayMarker("start", sid, cmd, m.start(), None, "malformed marker"))
+            if not m.id.isdigit():
+                stray.append(StrayMarker("start", m.id, m.command, m.offset, None, "malformed marker"))
                 continue
-            current = Entry(
-                id=int(sid),
-                command=cmd,
-                started=_float(parts[1]) if len(parts) > 1 else 0.0,
-                start_offset=m.end(),
-            )
+            current = Entry(id=int(m.id), command=m.command, started=m.epoch, start_offset=m.end)
         else:
-            parts = payload.split(";", 2)
-            sid = parts[0]
-            if current is None or sid != str(current.id):
+            if current is None or m.id != str(current.id):
                 stray.append(
                     StrayMarker(
                         "end",
-                        sid,
+                        m.id,
                         "",
-                        m.start(),
+                        m.offset,
                         current.id if current else None,
                         "forged: inside another entry's output" if current else "orphan end marker",
                     )
                 )
                 continue
-            current.end_offset = m.start()
-            current.raw = log[current.start_offset : m.start()]
-            try:
-                current.exit_code = int(parts[1])
-            except (IndexError, ValueError):
-                current.exit_code = None
+            current.end_offset = m.offset
+            current.raw = log[current.start_offset : m.offset]
+            current.exit_code = m.exit_code
+            if m.exit_code is None:
                 current.flags.append("unreadable exit code")
-            current.ended = _float(parts[2]) if len(parts) > 2 else None
+            current.ended = m.epoch
             entries.append(current)
             current = None
 

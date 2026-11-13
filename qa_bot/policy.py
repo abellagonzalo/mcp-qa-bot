@@ -12,8 +12,8 @@ command is impossible. Any refusal raises ``Refused`` with a reason. It combines
 - The production guard. It runs every time because the human (or an earlier command)
   can switch the kube context or database env mid-session. It looks at the command
   text (``--context prod-…``, ``-h db.prod…``, prod URLs), the pane shell's env as
-  published by the hooks at the last prompt (``KUBECONFIG``, ``PGHOST``,
-  ``PGDATABASE``, ``PGSERVICE``, ``DATABASE_URL``), and the active kube context,
+  published by the hooks at the last prompt (``KUBECONFIG`` and the database keys in
+  ``hooks.DB_ENV_KEYS``), and the active kube context,
   cluster and server for the pane's ``KUBECONFIG``.
 
 Which tools the agent *should* use is guidance, not enforcement (see ``tools.py``).
@@ -29,8 +29,9 @@ import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable
+
+from .hooks import DB_ENV_KEYS
 
 CONTROL_OPERATORS = {"|", "||", "&&", ";", "|&", ";;"}
 BACKGROUND_OPERATOR = "&"
@@ -60,7 +61,6 @@ _SQL_WHERE = re.compile(r"\bwhere\b", re.I)
 
 
 DEFAULT_PROD_PATTERN = r"(?<![a-z0-9])(prod|production|prd)(?![a-z])"
-DB_ENV_KEYS = ("PGHOST", "PGDATABASE", "PGSERVICE", "DATABASE_URL")
 
 
 class Refused(Exception):
@@ -222,20 +222,6 @@ def _check_limits(command: str) -> None:
 
 def _prod_pattern() -> re.Pattern[str]:
     return re.compile(os.environ.get("QA_BOT_PROD_PATTERN", DEFAULT_PROD_PATTERN), re.I)
-
-
-def read_pane_env(path: Path) -> dict[str, str]:
-    """The pane shell's env as the hooks publish it (``KEY=value`` lines; {} if absent)."""
-    env: dict[str, str] = {}
-    try:
-        text = path.read_text()
-    except OSError:
-        return env
-    for line in text.splitlines():
-        key, sep, value = line.partition("=")
-        if sep and value:
-            env[key] = value
-    return env
 
 
 def kube_context(pane_env: dict[str, str]) -> dict[str, str]:
