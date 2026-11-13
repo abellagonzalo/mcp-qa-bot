@@ -227,6 +227,36 @@ def parse_verdicts(verdicts: dict, t: transcript.Transcript, missing: list[dict]
     )
 
 
+def log_anomalies(t: transcript.Transcript, missing: list[dict], tests: list[TestCase]) -> list[str]:
+    """Warnings about the log itself; they can't be fixed by editing verdicts.
+
+    Forged or stray markers, ``exec`` calls with no markers, flagged entries no verdict
+    cites, and manual entries no verdict cites (they may have changed state).
+    """
+    cited = {c.entry.id for test in tests for c in test.evidence}
+    out: list[str] = []
+    for s in t.stray:
+        where = f"inside the output of #{s.inside}" if s.inside is not None else "at top level"
+        cmd = f" for {_table_code(s.command, 50)}" if s.command else ""
+        out.append(f"Log anomaly: {s.kind} marker #{s.id}{cmd} ({s.reason}), found {where}.")
+    for rec in missing:
+        eid = rec.get("id")
+        label = f"#{eid}" if eid is not None else "(no id)"
+        typed = _text(rec.get("typed_at"))[11:19] or "unknown time"
+        out.append(
+            f"Log anomaly: exec {label} {_table_code(_text(rec.get('command')), 50)} typed at {typed} "
+            "has no markers in the log (missing)."
+        )
+    for e in t.entries:
+        if e.flags and e.id not in cited:
+            out.append(f"Log anomaly: #{e.id} {_table_code(e.command, 50)}: {'; '.join(e.flags)}.")
+    manual = [e for e in t.entries if e.source == "manual" and e.id not in cited]
+    if manual:
+        listed = ", ".join(f"#{e.id} ({_table_code(e.command, 50)})" for e in manual)
+        out.append(f"Manual entries no verdict cites: {listed}.")
+    return out
+
+
 # ----------------------------------------------------------------- rendering
 
 
@@ -307,13 +337,7 @@ def render(
                         "is hard to read. Cite a narrower line range."
                     )
 
-    cited_by: dict[int, list[str]] = {}
-    missing_cited: dict[int, list[str]] = {}
-    for test in model.tests:
-        for c in test.citations:
-            key, table = (c.entry.id, cited_by) if isinstance(c, Citation) else (c.exec_id, missing_cited)
-            if test.id not in table.setdefault(key, []):
-                table[key].append(test.id)
+    warnings += log_anomalies(t, missing, model.tests)
 
     title = model.ticket or "QA session"
     meta = [f"{label}: {value}" for label, value in (("Env", model.env), ("Build", model.build)) if value]
@@ -370,31 +394,6 @@ def render(
             out += _evidence_block(c, mode, image)
 
     out += [
-        "## Timeline",
-        "| # | Time | Source | Command | Exit | Cited by |",
-        "|---|---|---|---|---|---|",
-    ]
-    for e in sorted(t.entries, key=lambda e: e.start_offset):
-        source = SOURCE_ICONS.get(e.source, "❔")
-        if e.flags:
-            source += " ⚠️"
-        exit_code = str(e.exit_code) if e.finished else "running"
-        cites = ", ".join(cited_by.get(e.id, [])) or "—"
-        out.append(f"| {e.id} | {_time(e.started)} | {source} | {_table_code(e.command)} | {exit_code} | {cites} |")
-    for s in t.stray:
-        where = f"inside #{s.inside}" if s.inside is not None else "top level"
-        cmd = _table_code(s.command) if s.command else "—"
-        out.append(f"| {s.id} | — | ⚠️ {s.kind} marker ({s.reason}, {where}) | {cmd} | — | — |")
-    for rec in missing:
-        typed = _text(rec.get("typed_at"))[11:19] or "—"
-        eid = rec.get("id")
-        cites = ", ".join(missing_cited.get(eid, [])) or "—"
-        out.append(
-            f"| {eid if eid is not None else '—'} | {typed} | 🤖 ⚠️ missing (no markers in the log) | "
-            f"{_table_code(_text(rec.get('command')))} | — | {cites} |"
-        )
-    out += [
-        "",
         f"<sub>Rendered by mcp-qa-bot. Evidence blocks are copied verbatim from {sess.LOG_NAME}; "
         f"verify with `shasum -a 256 -c {sess.HASH_NAME}`."
         + (

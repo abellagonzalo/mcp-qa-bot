@@ -197,7 +197,9 @@ async def render_report(
             then the text in a collapsed <details>.
 
     Fails if session.log or the index changed after close_session. Returns the report
-    path and validation warnings; fix them and render again.
+    path and warnings. Verdict warnings: fix the verdicts and render again. Warnings
+    starting "Log anomaly" or "Manual entries no verdict cites" are about the log
+    itself and can't be fixed through verdicts; report them to the user.
     """
     directory = Path(dir).expanduser() if dir else _last_dir
     if directory is None:

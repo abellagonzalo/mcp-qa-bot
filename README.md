@@ -21,7 +21,7 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
 | `peek(lines?)` | Shows the pane's recent contents | text + `idle` / `running` / `typing` |
 | `interrupt()` | Sends Ctrl-C | state |
 | `close_session(keep_tmux?)` | Stops recording, writes the exec index and the hashes | log path, entry count, sha256 |
-| `render_report(verdicts?, dir?, evidence?)` | Checks integrity, validates verdicts against the closed log, renders `qa-report.md` with evidence as `text`, `image` or `both` | report path, validation warnings |
+| `render_report(verdicts?, dir?, evidence?)` | Checks integrity, validates verdicts against the closed log, renders `qa-report.md` with evidence as `text`, `image` or `both` | report path, warnings (verdict problems and log anomalies) |
 
 ## How it works
 
@@ -42,6 +42,12 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
   the index), ⚠️ forged (inside another entry's output), ⚠️ missing (`exec` call with no
   markers). Entry output is cleaned deterministically: escape sequences are stripped
   and `\r` overwrites are replayed. Lines are numbered from 1 per entry.
+- The report has a summary table, then one section per test with its cited evidence.
+  There is no timeline of every entry. Anything wrong with the log instead becomes a
+  warning, shown in a `[!WARNING]` box at the top and returned by `render_report`:
+  each forged or stray marker, each `exec` call with no markers, each flagged entry
+  (command mismatch, unterminated) no verdict cites, and the list of manual entries no
+  verdict cites (they may have changed state). A clean run has no warning box.
 - Evidence is the cited lines (`$ command` + output, or just the cited range). With
   `evidence="image"` the same lines are drawn as PNGs with `freeze` into `evidence/`,
   for pasting into Jira, Confluence or a PR; `"both"` adds the text in a collapsed

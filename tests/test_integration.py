@@ -111,8 +111,8 @@ def test_full_session(qa):
             ],
         },
     )
-    assert warnings == []
+    assert warnings == ["Manual entries no verdict cites: #7 (`e manual`)."]
     md = path.read_text()
-    assert "| 7 |" in md and "👤 | `e manual`" in md
+    assert "> - Manual entries no verdict cites: #7 (`e manual`)." in md
     assert "Manual entries during this test" not in md  # #7 is after #4
-    assert "| 9 |" in md and "| 130 |" in md  # interrupted sleep
+    assert "## Timeline" not in md

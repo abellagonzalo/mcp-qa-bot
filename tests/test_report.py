@@ -56,9 +56,33 @@ VERDICTS = {
 }
 
 
+ANOMALIES = [
+    "Log anomaly: start marker #99 for `fake` (forged: inside another entry's output), found inside the output of #6.",
+    "Log anomaly: end marker #99 (forged: inside another entry's output), found inside the output of #6.",
+    "Log anomaly: exec (no id) `curl lost` typed at unknown time has no markers in the log (missing).",
+    "Manual entries no verdict cites: #3 (`kubectl logs payments-7d9f`), #6 (echo `x`).",
+]
+
+
+@pytest.fixture
+def clean_dir(tmp_path):
+    log = entry(1, "kubectl config current-context", b"staging\r\n", t=1000.0) + entry(2, POST, b"201", t=1001.0)
+    return make_dir(tmp_path, log, [{"id": 1, "command": "kubectl config current-context"}, {"id": 2, "command": POST}])
+
+
+CLEAN_VERDICTS = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [1, 2]}]}
+
+
+def test_clean_session_has_no_warning_box(clean_dir):
+    path, warnings = report.render_report(clean_dir, CLEAN_VERDICTS)
+    assert warnings == []
+    md = path.read_text()
+    assert "[!WARNING]" not in md and "Timeline" not in md
+
+
 def test_render_report(qa_dir):
     path, warnings = report.render_report(qa_dir, VERDICTS)
-    assert warnings == []
+    assert warnings == ANOMALIES
     md = path.read_text()
     assert md.startswith("# QA report: PAY-123\nEnv: staging · Build: payments@a1b2c3d · Log: session.log (sha256 ")
     assert "6 entries)" in md
@@ -67,9 +91,8 @@ def test_render_report(qa_dir):
     assert "### 🤖 #2 · " in md and "· exit 0 · 312 ms" in md
     assert f"$ {POST}\n201\n" in md
     assert "· lines 1-3\n```\n$ psql -c 'select count(*) from transfers'\n count\n-------\n     2\n```" in md
-    assert "| 3 |" in md and "| 👤 |" in md
-    assert "⚠️ start marker (forged: inside another entry's output, inside #6)" in md
-    assert "missing (no markers in the log)" in md
+    assert "## Timeline" not in md
+    assert "> [!WARNING]\n> Validation warnings:\n" + "".join(f"> - {w}\n" for w in ANOMALIES) in md
     assert "`echo `x``" not in md  # backtick commands are not wrapped in code
     assert json.loads((qa_dir / "verdicts.json").read_text()) == VERDICTS
 
@@ -133,7 +156,7 @@ def fake_freeze(monkeypatch):
 
 def test_image_evidence(qa_dir, fake_freeze):
     path, warnings = report.render_report(qa_dir, VERDICTS, mode="image")
-    assert warnings == []
+    assert warnings == ANOMALIES
     md = path.read_text()
     assert "![#2](evidence/T1-1.png)" in md
     assert "![#4](evidence/T1-2.png)" in md
@@ -240,25 +263,43 @@ def test_non_list_evidence_warns_and_renders(qa_dir):
     assert "## T1: g" in path.read_text()
 
 
-def test_rejected_item_is_not_credited_to_a_markerless_exec(qa_dir):
+def test_rejected_item_is_not_treated_as_a_markerless_exec(qa_dir):
     # {"lines": "1"} has no entry id; it must not match the index record with "id": None.
     bad = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [{"lines": "1"}, 2]}]}
     model = _model(qa_dir, bad)
     assert [c.entry.id for c in model.tests[0].citations] == [2]
-    md = report.render_report(qa_dir, bad)[0].read_text()
-    (row,) = [line for line in md.splitlines() if "missing (no markers in the log)" in line]
-    assert row.endswith("| — | — |")
+    assert model.warnings == ['T1: evidence item {"lines": "1"} is not an entry id or {"entry": id, "lines": "a-b"}.']
 
 
-def test_cited_missing_exec_is_credited_in_timeline(tmp_path):
+def test_cited_missing_exec(tmp_path):
     d = make_dir(tmp_path, entry(1, "kubectl get pods", b"ok\r\n"), [
         {"id": 1, "command": "kubectl get pods"},
-        {"id": 2, "command": "curl lost"},
+        {"id": 2, "command": "curl lost", "typed_at": "2026-11-13T14:02:10+00:00"},
     ])
     v = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [1, 2]}]}
     model = _model(d, v)
     assert model.tests[0].citations[1] == report.MissingCitation(2)
     assert [c.entry.id for c in model.tests[0].evidence] == [1]
-    assert "T1: cites #2, an exec call with no markers in the log (missing)." in model.warnings
-    md = report.render_report(d, v)[0].read_text()
-    assert "| 2 | — | 🤖 ⚠️ missing (no markers in the log) | `curl lost` | — | T1 |" in md
+    _, warnings = report.render_report(d, v)
+    assert warnings == [
+        "T1: cites #2, an exec call with no markers in the log (missing).",
+        "Log anomaly: exec #2 `curl lost` typed at 14:02:10 has no markers in the log (missing).",
+    ]
+
+
+def test_manual_entries_cited_by_a_verdict_are_not_warned(qa_dir):
+    v = json.loads(json.dumps(VERDICTS))
+    v["tests"][0]["evidence"] += [3, 6]
+    _, warnings = report.render_report(qa_dir, v)
+    assert not any(w.startswith("Manual entries") for w in warnings)
+    assert sum(w.startswith("Log anomaly") for w in warnings) == 3  # markers and missing stay
+
+
+def test_uncited_flagged_entry_warns(tmp_path):
+    d = make_dir(tmp_path, entry(1, "kubectl get pods", b"ok\r\n") + entry(2, "printf 1", b"1"), [
+        {"id": 1, "command": "kubectl get pods"},
+        {"id": 2, "command": "printf 2"},
+    ])
+    v = {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [1]}]}
+    _, warnings = report.render_report(d, v)
+    assert warnings == ["Log anomaly: #2 `printf 1`: command in the log differs from the command exec typed."]

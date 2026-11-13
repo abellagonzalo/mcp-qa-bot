@@ -138,8 +138,12 @@ for long output.
 
 ## 7. Report
 
-Call `render_report(verdicts)`. If it returns validation warnings, fix the verdicts
-and render again until it returns none.
+Call `render_report(verdicts)`. If it returns warnings about the verdicts, fix the
+verdicts and render again until none are left. Warnings starting "Log anomaly" or
+"Manual entries no verdict cites" are about the log itself (forged or stray markers,
+`exec` calls with no markers, commands typed in the pane that no test cites): they
+can't be fixed through verdicts. Don't hide them by citing entries that don't support
+a test; list them for the user in your chat reply.
 
 Evidence is text by default. When the user wants images (to paste into Jira,
 Confluence or a PR), pass `evidence="image"`, or `"both"` to keep the text in a
