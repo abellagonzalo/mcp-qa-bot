@@ -4,16 +4,13 @@ import shutil
 import pytest
 from logfake import end, entry, start
 
-from qa_bot import evidence, report, session
+from qa_bot import evidence, record, report
 
 
 def make_dir(tmp_path, log: bytes, execs: list[dict], polls: list[dict] | None = None):
-    (tmp_path / session.LOG_NAME).write_bytes(log)
-    doc = {"session": "t", "execs": execs}
-    if polls is not None:
-        doc["polls"] = polls
-    (tmp_path / session.INDEX_NAME).write_text(json.dumps(doc))
-    session.write_hash_file(tmp_path)
+    """A closed session folder, written the way Session.close writes it."""
+    (tmp_path / record.LOG_NAME).write_bytes(log)
+    record.write(tmp_path, "t", execs, polls or [])
     return tmp_path
 
 
@@ -121,9 +118,9 @@ def test_validation_warnings(qa_dir):
 
 
 def test_tampered_log_is_rejected(qa_dir):
-    with (qa_dir / session.LOG_NAME).open("ab") as fh:
+    with (qa_dir / record.LOG_NAME).open("ab") as fh:
         fh.write(b"tamper")
-    with pytest.raises(session.SessionError, match="Integrity"):
+    with pytest.raises(record.RecordError, match="Integrity"):
         report.render_report(qa_dir, VERDICTS)
 
 
@@ -279,12 +276,24 @@ def test_real_freeze_renders_png(qa_dir):
 
 
 def _model(qa_dir, verdicts):
-    from qa_bot import transcript
+    return report.parse_verdicts(verdicts, record.load(qa_dir))
 
-    index = json.loads((qa_dir / session.INDEX_NAME).read_text())["execs"]
-    t = transcript.parse((qa_dir / session.LOG_NAME).read_bytes())
-    missing = transcript.classify(t, index)
-    return report.parse_verdicts(verdicts, t, missing)
+
+def test_render_from_an_in_memory_record():
+    rec = record.Record.build(
+        entry(1, "kubectl get pods", b"ok\r\n") + entry(2, "ls", b"a\r\n"),
+        [{"id": 1, "command": "kubectl get pods"}, {"id": 7, "command": "curl lost", "typed_at": "2026-11-13T09:05:01+01:00"}],
+        log_hash="ab" * 32,
+    )
+    md, warnings = report.render(
+        {"tests": [{"id": "T1", "goal": "g", "expected": "e", "verdict": "pass", "evidence": [1]}]}, rec
+    )
+    assert "Log: session.log (sha256 abab…abab, 2 entries)" in md
+    assert "### 🤖 #1 · " in md
+    assert warnings == [
+        "Log anomaly: exec #7 `curl lost` typed at 09:05:01 has no markers in the log (missing).",
+        "Manual entries no verdict cites: #2 (`ls`).",
+    ]
 
 
 def test_parse_verdicts_normalizes_tests(qa_dir):
@@ -432,8 +441,8 @@ def test_single_attempt_poll(tmp_path):
 
 
 def test_poll_index_is_covered_by_the_hash(poll_dir):
-    doc = json.loads((poll_dir / session.INDEX_NAME).read_text())
+    doc = json.loads((poll_dir / record.INDEX_NAME).read_text())
     doc["polls"][0]["outcome"] = "exhausted"
-    (poll_dir / session.INDEX_NAME).write_text(json.dumps(doc))
-    with pytest.raises(session.SessionError, match="changed after"):
+    (poll_dir / record.INDEX_NAME).write_text(json.dumps(doc))
+    with pytest.raises(record.RecordError, match="changed after"):
         report.render_report(poll_dir, _poll_verdicts([1]))

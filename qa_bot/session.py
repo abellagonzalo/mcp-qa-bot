@@ -11,14 +11,12 @@ Mechanics:
   hooks report that this command finished.
 - ``poll`` runs ``exec`` once per attempt until the output matches a regex; every
   attempt is a normal entry, and the attempts are recorded as one poll group.
-- ``close`` stops ``pipe-pane`` and writes ``session.index.json`` (exec records and
-  poll groups) and ``session.log.sha256``.
+- ``close`` stops ``pipe-pane`` and hands the exec records and poll groups to
+  ``record.write`` (``session.index.json`` and ``session.log.sha256``).
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import re
 import secrets
@@ -32,13 +30,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import transcript
+from . import record, transcript
 from .policy import Policy, read_pane_env
 
 HOOKS = Path(__file__).with_name("hooks.zsh")
-LOG_NAME = "session.log"
-INDEX_NAME = "session.index.json"
-HASH_NAME = "session.log.sha256"
 HANDSHAKE_TIMEOUT = 30.0
 FLUSH_GRACE = 2.0  # how long to wait for pipe-pane to deliver bytes after a signal
 
@@ -86,39 +81,6 @@ def slug(text: str) -> str:
     return s[:40] or "qa"
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def write_hash_file(directory: Path) -> str:
-    log_hash = sha256_file(directory / LOG_NAME)
-    index_hash = sha256_file(directory / INDEX_NAME)
-    (directory / HASH_NAME).write_text(f"{log_hash}  {LOG_NAME}\n{index_hash}  {INDEX_NAME}\n")
-    return log_hash
-
-
-def verify_hash_file(directory: Path) -> str:
-    """Return the log's sha256 if session.log and the index still match the hash file."""
-    hash_file = directory / HASH_NAME
-    if not hash_file.exists():
-        raise SessionError(f"{hash_file} not found: close the session before rendering the report.")
-    expected: dict[str, str] = {}
-    for line in hash_file.read_text().splitlines():
-        digest, _, name = line.partition("  ")
-        expected[name.strip()] = digest.strip()
-    for name in (LOG_NAME, INDEX_NAME):
-        path = directory / name
-        if not path.exists():
-            raise SessionError(f"Integrity check failed: {name} is missing.")
-        if sha256_file(path) != expected.get(name):
-            raise SessionError(f"Integrity check failed: {name} changed after the session was closed.")
-    return expected[LOG_NAME]
-
-
 @dataclass
 class ExecResult:
     status: str  # done | TIMEOUT | BUSY
@@ -158,7 +120,7 @@ class Session:
 
     @property
     def log_path(self) -> Path:
-        return self.dir / LOG_NAME
+        return self.dir / record.LOG_NAME
 
     @property
     def target(self) -> str:
@@ -182,8 +144,8 @@ class Session:
     ) -> "Session":
         session_name = slug(name)
         directory = Path(directory).expanduser().resolve()
-        if (directory / LOG_NAME).exists():
-            raise SessionError(f"{directory / LOG_NAME} already exists; use a new folder per session.")
+        if (directory / record.LOG_NAME).exists():
+            raise SessionError(f"{directory / record.LOG_NAME} already exists; use a new folder per session.")
         if _has_session(session_name):
             raise SessionError(f"tmux session '{session_name}' already exists; pick another name.")
         zsh = shutil.which("zsh")
@@ -225,8 +187,7 @@ class Session:
             raise SessionError("Session already closed.")
         tmux("pipe-pane", "-t", self.target, check=False)  # no command = stop piping
         _wait_stable(self.log_path)
-        (self.dir / INDEX_NAME).write_text(json.dumps({"session": self.name, "execs": self.index, "polls": self.polls}, indent=2) + "\n")
-        log_hash = write_hash_file(self.dir)
+        log_hash = record.write(self.dir, self.name, self.index, self.polls)
         self.closed = True
         if kill:
             tmux("kill-session", "-t", f"={self.name}", check=False)

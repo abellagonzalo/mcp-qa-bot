@@ -16,9 +16,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import evidence
-from . import session as sess
-from . import transcript
+from . import evidence, transcript
+from .record import HASH_NAME, LOG_NAME, PollGroup, Record
+from .record import load as load_record
 
 REPORT_NAME = "qa-report.md"
 VERDICTS_NAME = "verdicts.json"
@@ -49,17 +49,6 @@ class Citation:
     @property
     def entry_ids(self) -> list[int]:
         return [self.entry.id]
-
-
-@dataclass(frozen=True)
-class PollGroup:
-    """A ``poll`` call as recorded in the index: its attempts are entry ids in the log."""
-
-    poll_id: int
-    command: str
-    until: str
-    outcome: str
-    attempts: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -142,27 +131,12 @@ def _text(value) -> str:
 # ---------------------------------------------------------------- validation
 
 
-def parse_polls(raw) -> list[PollGroup]:
-    """Poll groups from the index (absent in sessions recorded before ``poll`` existed)."""
-    groups: list[PollGroup] = []
-    for g in raw if isinstance(raw, list) else []:
-        if not isinstance(g, dict) or not isinstance(g.get("poll_id"), int):
-            continue
-        attempts = tuple(a for a in g.get("attempts") or [] if isinstance(a, int) and not isinstance(a, bool))
-        groups.append(
-            PollGroup(g["poll_id"], _text(g.get("command")), _text(g.get("until")), _text(g.get("outcome")), attempts)
-        )
-    return groups
-
-
 def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _poll_citation(
-    group: PollGroup, t: transcript.Transcript, test_id: str, warnings: list[str]
-) -> PollCitation | None:
-    by_id = t.by_id()
+def _poll_citation(group: PollGroup, rec: Record, test_id: str, warnings: list[str]) -> PollCitation | None:
+    by_id = rec.by_id()
     entries = tuple(by_id[a] for a in group.attempts if a in by_id)
     if not entries:
         warnings.append(f"{test_id}: cites poll P{group.poll_id}, which has no attempts in the log.")
@@ -172,20 +146,19 @@ def _poll_citation(
 
 def _parse_citation(
     item,
-    t: transcript.Transcript,
+    rec: Record,
     missing_ids: set[int],
     test_id: str,
     warnings: list[str],
-    polls: list[PollGroup] | None = None,
 ) -> Citation | PollCitation | MissingCitation | None:
-    by_id = t.by_id()
-    polls = polls or []
+    by_id = rec.by_id()
+    polls = rec.polls
     if isinstance(item, dict) and set(item) == {"poll"} and _is_int(item["poll"]):
         group = next((g for g in polls if g.poll_id == item["poll"]), None)
         if group is None:
             warnings.append(f"{test_id}: cites poll P{item['poll']}, which is not in the session index.")
             return None
-        return _poll_citation(group, t, test_id, warnings)
+        return _poll_citation(group, rec, test_id, warnings)
     if _is_int(item):
         eid, lines = item, None
     elif isinstance(item, dict) and _is_int(item.get("entry")):
@@ -200,14 +173,14 @@ def _parse_citation(
     if lines is None and eid in by_id:
         group = next((g for g in polls if eid in g.attempts), None)
         if group is not None:  # an attempt cited whole stands for its poll group
-            return _poll_citation(group, t, test_id, warnings)
+            return _poll_citation(group, rec, test_id, warnings)
 
     entry = by_id.get(eid)
     if entry is None:
         if eid in missing_ids:
             warnings.append(f"{test_id}: cites #{eid}, an exec call with no markers in the log (missing).")
             return MissingCitation(eid)
-        if any(s.id == str(eid) for s in t.stray):
+        if any(s.id == str(eid) for s in rec.stray):
             warnings.append(f"{test_id}: cites #{eid}, which only exists as a forged/orphan marker.")
         else:
             warnings.append(f"{test_id}: cites #{eid}, which is not in the log.")
@@ -228,9 +201,7 @@ def _parse_citation(
     return Citation(entry, (start, end))
 
 
-def parse_verdicts(
-    verdicts: dict, t: transcript.Transcript, missing: list[dict], polls: list[PollGroup] | None = None
-) -> Verdicts:
+def parse_verdicts(verdicts: dict, rec: Record) -> Verdicts:
     """Parse the agent's verdicts once into a normalized model, collecting warnings.
 
     Raises ``ReportError`` only when the shape is unusable (not an object, no test list).
@@ -243,7 +214,7 @@ def parse_verdicts(
 
     warnings: list[str] = []
     # Exec calls that never saw a start marker are indexed with "id": None; they can't be cited.
-    missing_ids = {rec["id"] for rec in missing if isinstance(rec.get("id"), int)}
+    missing_ids = {m.id for m in rec.missing if m.id is not None}
     seen: set[str] = set()
     tests: list[TestCase] = []
     limit = max_uncited_lines()
@@ -277,7 +248,7 @@ def parse_verdicts(
         cits: list[Citation | PollCitation | MissingCitation] = []
         seen_polls: set[int] = set()
         for item in items:
-            c = _parse_citation(item, t, missing_ids, tid, warnings, polls)
+            c = _parse_citation(item, rec, missing_ids, tid, warnings)
             if isinstance(c, PollCitation):
                 if c.group.poll_id in seen_polls:
                     continue  # several attempts of one poll cited: one block
@@ -316,7 +287,7 @@ def parse_verdicts(
     )
 
 
-def log_anomalies(t: transcript.Transcript, missing: list[dict], tests: list[TestCase]) -> list[str]:
+def log_anomalies(rec: Record, tests: list[TestCase]) -> list[str]:
     """Warnings about the log itself; they can't be fixed by editing verdicts.
 
     Forged or stray markers, ``exec`` calls with no markers, flagged entries no verdict
@@ -324,22 +295,21 @@ def log_anomalies(t: transcript.Transcript, missing: list[dict], tests: list[Tes
     """
     cited = {i for test in tests for i in test.cited_ids}
     out: list[str] = []
-    for s in t.stray:
+    for s in rec.stray:
         where = f"inside the output of #{s.inside}" if s.inside is not None else "at top level"
         cmd = f" for {_table_code(s.command, 50)}" if s.command else ""
         out.append(f"Log anomaly: {s.kind} marker #{s.id}{cmd} ({s.reason}), found {where}.")
-    for rec in missing:
-        eid = rec.get("id")
-        label = f"#{eid}" if eid is not None else "(no id)"
-        typed = _text(rec.get("typed_at"))[11:19] or "unknown time"
+    for m in rec.missing:
+        label = f"#{m.id}" if m.id is not None else "(no id)"
+        typed = m.typed_at.strftime("%H:%M:%S") if m.typed_at else "unknown time"
         out.append(
-            f"Log anomaly: exec {label} {_table_code(_text(rec.get('command')), 50)} typed at {typed} "
+            f"Log anomaly: exec {label} {_table_code(m.command, 50)} typed at {typed} "
             "has no markers in the log (missing)."
         )
-    for e in t.entries:
+    for e in rec.entries:
         if e.flags and e.id not in cited:
             out.append(f"Log anomaly: #{e.id} {_table_code(e.command, 50)}: {'; '.join(e.flags)}.")
-    manual = [e for e in t.entries if e.source == "manual" and e.id not in cited]
+    manual = [e for e in rec.entries if e.source == "manual" and e.id not in cited]
     if manual:
         listed = ", ".join(f"#{e.id} ({_table_code(e.command, 50)})" for e in manual)
         out.append(f"Manual entries no verdict cites: {listed}.")
@@ -433,15 +403,12 @@ def _evidence_block(c: Citation | PollCitation, blocks: evidence.Renderer, test_
 
 def render(
     verdicts: dict,
-    t: transcript.Transcript,
-    missing: list[dict],
-    log_hash: str,
+    rec: Record,
     blocks: evidence.Renderer | None = None,
-    polls: list[PollGroup] | None = None,
 ) -> tuple[str, list[str]]:
-    """Render the report markdown. ``blocks`` renders the evidence (default: text)."""
+    """Render the report markdown for a loaded record. ``blocks`` renders the evidence (default: text)."""
     blocks = blocks or evidence.Renderer()
-    model = parse_verdicts(verdicts, t, missing, polls)
+    model = parse_verdicts(verdicts, rec)
 
     sections: list[str] = []
     for test in model.tests:
@@ -459,7 +426,7 @@ def render(
             cited = test.cited_ids
             ids = sorted(cited)
             manual = [
-                e for e in t.entries
+                e for e in rec.entries
                 if e.source == "manual" and min(ids) < e.id < max(ids) and e.id not in cited
             ]
             if manual:
@@ -469,11 +436,11 @@ def render(
         for k, c in enumerate(cits, 1):
             sections += _evidence_block(c, blocks, test.id, k)
 
-    warnings = model.warnings + blocks.warnings + log_anomalies(t, missing, model.tests)
+    warnings = model.warnings + blocks.warnings + log_anomalies(rec, model.tests)
 
     title = model.ticket or "QA session"
     meta = [f"{label}: {value}" for label, value in (("Env", model.env), ("Build", model.build)) if value]
-    meta.append(f"Log: {sess.LOG_NAME} (sha256 {_short_hash(log_hash)}, {len(t.entries)} entries)")
+    meta.append(f"Log: {LOG_NAME} (sha256 {_short_hash(rec.log_hash)}, {len(rec.entries)} entries)")
 
     out: list[str] = [f"# QA report: {title}", " · ".join(meta), ""]
 
@@ -491,8 +458,8 @@ def render(
     out += sections
 
     out += [
-        f"<sub>Rendered by mcp-qa-bot. Evidence blocks are copied verbatim from {sess.LOG_NAME}; "
-        f"verify with `shasum -a 256 -c {sess.HASH_NAME}`.{blocks.footer()}</sub>",
+        f"<sub>Rendered by mcp-qa-bot. Evidence blocks are copied verbatim from {LOG_NAME}; "
+        f"verify with `shasum -a 256 -c {HASH_NAME}`.{blocks.footer()}</sub>",
         "",
     ]
     return "\n".join(out), warnings
@@ -512,7 +479,7 @@ def render_report(
     """
     directory = Path(directory).expanduser().resolve()
     blocks = evidence.Renderer(mode, directory, drawer)  # validates mode, preflights the drawer
-    log_hash = sess.verify_hash_file(directory)
+    rec = load_record(directory)  # verifies the hashes first
 
     verdicts_path = directory / VERDICTS_NAME
     if verdicts is not None:
@@ -525,13 +492,8 @@ def render_report(
     else:
         raise ReportError(f"No verdicts given and {verdicts_path} does not exist.")
 
-    index_doc = json.loads((directory / sess.INDEX_NAME).read_text())
-    index = index_doc.get("execs", [])
-    polls = parse_polls(index_doc.get("polls"))
-    t = transcript.parse((directory / sess.LOG_NAME).read_bytes())
-    missing = transcript.classify(t, index)
     with blocks:
-        markdown, warnings = render(verdicts, t, missing, log_hash, blocks, polls)
+        markdown, warnings = render(verdicts, rec, blocks)
     report_path = directory / REPORT_NAME
     report_path.write_text(markdown)
     return report_path, warnings

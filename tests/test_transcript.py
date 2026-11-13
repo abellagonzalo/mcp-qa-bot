@@ -39,14 +39,3 @@ def test_unterminated_entry():
     assert t.entries[1].lines == ["partial"]
     assert t.entries[1].flags
 
-
-def test_classify_agent_manual_missing():
-    t = transcript.parse(entry(1, "kubectl get ns", b"") + entry(2, "ls", b"") + entry(3, "curl y", b""))
-    index = [
-        {"id": 1, "command": "kubectl get ns"},
-        {"id": 3, "command": "curl DIFFERENT"},
-        {"id": None, "command": "curl z"},
-    ]
-    missing = transcript.classify(t, index)
-    assert [e.source for e in t.entries] == ["agent", "manual", "mismatch"]
-    assert missing == [{"id": None, "command": "curl z"}]

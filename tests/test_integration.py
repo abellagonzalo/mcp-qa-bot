@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from qa_bot import report, session
+from qa_bot import record, report, session
 from qa_bot.policy import Policy, Refused
 
 pytestmark = pytest.mark.skipif(
@@ -100,10 +100,10 @@ def test_full_session(qa):
     log_hash, count = qa.close()
     assert count == 9
     d = qa.dir
-    assert subprocess.run(["shasum", "-a", "256", "-c", session.HASH_NAME], cwd=d, capture_output=True).returncode == 0
-    idx = json.loads((d / session.INDEX_NAME).read_text())["execs"]
+    assert subprocess.run(["shasum", "-a", "256", "-c", record.HASH_NAME], cwd=d, capture_output=True).returncode == 0
+    idx = json.loads((d / record.INDEX_NAME).read_text())["execs"]
     assert [e["id"] for e in idx] == [1, 2, 3, 4, 5, 6, 8, 9]
-    assert b"source " not in (d / session.LOG_NAME).read_bytes()
+    assert b"source " not in (d / record.LOG_NAME).read_bytes()
 
     path, warnings = report.render_report(
         d,
@@ -143,7 +143,7 @@ def test_multiline_loop_and_poll(qa):
     assert (p2.poll_id, p2.outcome, p2.entry_ids) == (2, "exhausted", [5, 6])
 
     qa.close()
-    doc = json.loads((qa.dir / session.INDEX_NAME).read_text())
+    doc = json.loads((qa.dir / record.INDEX_NAME).read_text())
     assert [(g["poll_id"], g["attempts"], g["outcome"]) for g in doc["polls"]] == [
         (1, [2, 3, 4], "matched"),
         (2, [5, 6], "exhausted"),
@@ -178,5 +178,5 @@ def test_policy_sees_env_the_human_sets_in_the_pane(qa):
         qa.poll("echo after", "x", 0.1, 2, 10)
     assert qa.polls == []
     qa.close()
-    idx = json.loads((qa.dir / session.INDEX_NAME).read_text())["execs"]
+    idx = json.loads((qa.dir / record.INDEX_NAME).read_text())["execs"]
     assert [e["command"] for e in idx] == ["echo before"]

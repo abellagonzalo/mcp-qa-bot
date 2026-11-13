@@ -35,7 +35,7 @@ class Entry:
     exit_code: int | None = None
     ended: float | None = None
     raw: bytes = b""
-    source: str = "manual"  # agent | manual | mismatch
+    source: str = "manual"  # agent | manual | mismatch; set by record.Record.build
     flags: list[str] = field(default_factory=list)
 
     @property
@@ -182,28 +182,3 @@ def clean_output(raw: bytes) -> list[str]:
         lines.pop()
     return lines
 
-
-def classify(transcript: Transcript, index: list[dict]) -> list[dict]:
-    """Mark entries as agent/manual/mismatch using the exec index.
-
-    Returns the index records that have no matching entry in the log ("missing").
-    """
-    by_id = transcript.by_id()
-    matched: set[int] = set()
-    missing: list[dict] = []
-    for rec in index:
-        eid = rec.get("id")
-        entry = by_id.get(eid) if isinstance(eid, int) else None
-        if entry is None:
-            missing.append(rec)
-            continue
-        matched.add(entry.id)
-        if normalise_command(entry.command) == normalise_command(rec.get("command", "")):
-            entry.source = "agent"
-        else:
-            entry.source = "mismatch"
-            entry.flags.append("command in the log differs from the command exec typed")
-    for entry in transcript.entries:
-        if entry.id not in matched:
-            entry.source = "manual"
-    return missing
