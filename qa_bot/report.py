@@ -135,11 +135,6 @@ def _table_code(cmd: str, width: int = 80) -> str:
     return f"`{text}`" if "`" not in text else text
 
 
-def _fence(lines: list[str]) -> str:
-    longest = max((len(m) for line in lines for m in re.findall(r"`+", line)), default=0)
-    return "`" * max(3, longest + 1)
-
-
 def _text(value) -> str:
     return "" if value is None else str(value).strip()
 
@@ -366,7 +361,7 @@ def _capped(lines: list[str]) -> tuple[list[str], str | None]:
     return lines[:limit], f"… {len(lines) - limit} more lines not shown (lines 1-{limit} of {len(lines)})"
 
 
-def _poll_body(c: PollCitation) -> tuple[list[str], list[str], int]:
+def _poll_body(c: PollCitation) -> tuple[list[str], list[str]]:
     g = c.group
     first, last = c.entries[0], c.entries[-1]
     ids = f"#{first.id}" if first is last else f"#{first.id}–#{last.id}"
@@ -377,7 +372,6 @@ def _poll_body(c: PollCitation) -> tuple[list[str], list[str], int]:
     head.append(f"polled {n}× over {elapsed} s until /{g.until}/ ({g.outcome or 'unknown'})")
     cmd_lines = first.command.split("\n")
     body = [f"$ {cmd_lines[0]}", *cmd_lines[1:]]
-    count = 0
     for e in _poll_shown(c):
         attempt = g.attempts.index(e.id) + 1
         label = [f"attempt {attempt}", _time(e.started)]
@@ -386,14 +380,13 @@ def _poll_body(c: PollCitation) -> tuple[list[str], list[str], int]:
         body.append(f"[{' · '.join(label)}]")
         shown, note = _capped(e.lines)
         body += shown
-        count += len(shown)
         if note:
             body.append(note)
-    return head, body, count
+    return head, body
 
 
-def _evidence_body(c: Citation | PollCitation) -> tuple[list[str], list[str], int]:
-    """Heading parts, ``$ command`` + shown output lines (+ truncation note), output line count."""
+def _evidence_body(c: Citation | PollCitation) -> tuple[list[str], list[str]]:
+    """Heading parts, and ``$ command`` + shown output lines (+ truncation note)."""
     if isinstance(c, PollCitation):
         return _poll_body(c)
     e = c.entry
@@ -413,7 +406,7 @@ def _evidence_body(c: Citation | PollCitation) -> tuple[list[str], list[str], in
     body = [f"$ {cmd_lines[0]}", *cmd_lines[1:], *shown]
     if note:
         body.append(note)
-    return head, body, len(shown)
+    return head, body
 
 
 def _flags(c: Citation | PollCitation) -> list[str]:
@@ -428,26 +421,12 @@ def _alt(c: Citation | PollCitation) -> str:
     return f"#{c.entry.id}" + (f" lines {c.lines[0]}-{c.lines[1]}" if c.lines else "")
 
 
-def _evidence_block(c: Citation | PollCitation, mode: str = "text", image: Path | None = None) -> list[str]:
-    """One evidence block: heading, flags, then the cited lines as text, image or both.
-
-    Text and image are drawn from the same ``body`` lines, so they cannot disagree.
-    """
-    head, body, _ = _evidence_body(c)
+def _evidence_block(c: Citation | PollCitation, blocks: evidence.Renderer, test_id: str, k: int) -> list[str]:
+    """One evidence block: heading and flags, then the cited lines as ``blocks`` renders them."""
+    head, body = _evidence_body(c)
     out = [f"### {' · '.join(head)}"]
-    for flag in _flags(c):
-        out.append(f"> ⚠️ {flag}")
-    if mode in ("image", "both"):
-        if image is None:
-            raise ReportError("image evidence needs an image path.")
-        evidence.render_png(body, image)
-        alt = _alt(c)
-        out += [f"![{alt}]({evidence.EVIDENCE_DIR}/{image.name})", ""]
-    fence = _fence(body)
-    if mode == "text":
-        out += [fence, *body, fence]
-    elif mode == "both":
-        out += ["<details><summary>text</summary>", "", fence, *body, fence, "", "</details>"]
+    out += [f"> ⚠️ {flag}" for flag in _flags(c)]
+    out += blocks.block(test_id, k, _alt(c), body)
     out.append("")
     return out
 
@@ -457,31 +436,40 @@ def render(
     t: transcript.Transcript,
     missing: list[dict],
     log_hash: str,
-    mode: str = "text",
-    directory: Path | None = None,
+    blocks: evidence.Renderer | None = None,
     polls: list[PollGroup] | None = None,
 ) -> tuple[str, list[str]]:
-    """Render the report markdown. ``mode`` is text, image or both; image modes write
-    PNGs into ``<directory>/evidence/``."""
-    if mode not in evidence.MODES:
-        raise ReportError(f"evidence must be one of {', '.join(evidence.MODES)}, not '{mode}'.")
-    images = mode in ("image", "both")
-    if images and directory is None:
-        raise ReportError("image evidence needs the session folder.")
+    """Render the report markdown. ``blocks`` renders the evidence (default: text)."""
+    blocks = blocks or evidence.Renderer()
     model = parse_verdicts(verdicts, t, missing, polls)
-    warnings = model.warnings
-    if images:
-        img_limit = evidence.max_image_lines()
-        for test in model.tests:
-            for c in test.evidence:
-                shown = _evidence_body(c)[2]
-                if shown > img_limit:
-                    warnings.append(
-                        f"{test.id}: {_alt(c).split(' lines')[0]} shows {shown} lines; an image over {img_limit} lines "
-                        "is hard to read. Cite a narrower line range."
-                    )
 
-    warnings += log_anomalies(t, missing, model.tests)
+    sections: list[str] = []
+    for test in model.tests:
+        cits = test.evidence
+        sections.append(f"## {test.id}: {test.goal}")
+        fields = [
+            ("Input", test.input),
+            ("Expected", test.expected),
+            ("Actual", test.actual),
+            ("Verdict", VERDICT_ICONS.get(test.verdict, "❔ " + test.verdict)),
+            ("Note", test.note),
+        ]
+        sections += [f"**{label}:** {value}  " for label, value in fields if value]
+        if cits:
+            cited = test.cited_ids
+            ids = sorted(cited)
+            manual = [
+                e for e in t.entries
+                if e.source == "manual" and min(ids) < e.id < max(ids) and e.id not in cited
+            ]
+            if manual:
+                listed = ", ".join(f"#{e.id} ({_table_code(e.command, 50)})" for e in manual)
+                sections.append(f"👤 Manual entries during this test: {listed}  ")
+        sections.append("")
+        for k, c in enumerate(cits, 1):
+            sections += _evidence_block(c, blocks, test.id, k)
+
+    warnings = model.warnings + blocks.warnings + log_anomalies(t, missing, model.tests)
 
     title = model.ticket or "QA session"
     meta = [f"{label}: {value}" for label, value in (("Env", model.env), ("Build", model.build)) if value]
@@ -500,71 +488,30 @@ def render(
         goal = test.goal.replace("|", "\\|")
         out.append(f"| {test.id} | {goal} | {icon} |")
     out.append("")
-
-    image_dir = evidence.reset_dir(directory) if images else None
-    used_names: set[str] = set()
-    for test in model.tests:
-        cits = test.evidence
-        out.append(f"## {test.id}: {test.goal}")
-        fields = [
-            ("Input", test.input),
-            ("Expected", test.expected),
-            ("Actual", test.actual),
-            ("Verdict", VERDICT_ICONS.get(test.verdict, "❔ " + test.verdict)),
-            ("Note", test.note),
-        ]
-        out += [f"**{label}:** {value}  " for label, value in fields if value]
-        if cits:
-            cited = test.cited_ids
-            ids = sorted(cited)
-            manual = [
-                e for e in t.entries
-                if e.source == "manual" and min(ids) < e.id < max(ids) and e.id not in cited
-            ]
-            if manual:
-                listed = ", ".join(f"#{e.id} ({_table_code(e.command, 50)})" for e in manual)
-                out.append(f"👤 Manual entries during this test: {listed}  ")
-        out.append("")
-        for k, c in enumerate(cits, 1):
-            image = None
-            if images:
-                # Duplicate test ids (already warned about) must not overwrite each other's images.
-                name, n = evidence.file_name(test.id, k), 1
-                while name in used_names:
-                    n += 1
-                    name = evidence.file_name(f"{test.id}_{n}", k)
-                used_names.add(name)
-                image = image_dir / name
-            out += _evidence_block(c, mode, image)
+    out += sections
 
     out += [
         f"<sub>Rendered by mcp-qa-bot. Evidence blocks are copied verbatim from {sess.LOG_NAME}; "
-        f"verify with `shasum -a 256 -c {sess.HASH_NAME}`."
-        + (
-            f" Images in {evidence.EVIDENCE_DIR}/ are rendered from the same lines and can be "
-            "regenerated with render_report."
-            if images
-            else ""
-        )
-        + "</sub>",
+        f"verify with `shasum -a 256 -c {sess.HASH_NAME}`.{blocks.footer()}</sub>",
         "",
     ]
     return "\n".join(out), warnings
 
 
 def render_report(
-    directory: Path, verdicts: dict | None = None, mode: str = "text"
+    directory: Path,
+    verdicts: dict | None = None,
+    mode: str = "text",
+    drawer: evidence.Drawer | None = None,
 ) -> tuple[Path, list[str]]:
     """Integrity check, validation and rendering; writes ``<directory>/qa-report.md``.
 
     ``mode`` is how cited lines appear: ``text`` (code blocks), ``image`` (PNGs in
-    ``evidence/``) or ``both``.
+    ``evidence/``) or ``both``. ``drawer`` draws the images (default: ``freeze``).
+    If rendering fails, the previous report and its images are left untouched.
     """
-    if mode not in evidence.MODES:
-        raise ReportError(f"evidence must be one of {', '.join(evidence.MODES)}, not '{mode}'.")
-    if mode != "text":
-        evidence.freeze_path()  # fail before writing anything
     directory = Path(directory).expanduser().resolve()
+    blocks = evidence.Renderer(mode, directory, drawer)  # validates mode, preflights the drawer
     log_hash = sess.verify_hash_file(directory)
 
     verdicts_path = directory / VERDICTS_NAME
@@ -583,7 +530,8 @@ def render_report(
     polls = parse_polls(index_doc.get("polls"))
     t = transcript.parse((directory / sess.LOG_NAME).read_bytes())
     missing = transcript.classify(t, index)
-    markdown, warnings = render(verdicts, t, missing, log_hash, mode, directory, polls)
+    with blocks:
+        markdown, warnings = render(verdicts, t, missing, log_hash, blocks, polls)
     report_path = directory / REPORT_NAME
     report_path.write_text(markdown)
     return report_path, warnings

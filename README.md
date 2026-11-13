@@ -55,7 +55,8 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
   for pasting into Jira, Confluence or a PR; `"both"` adds the text in a collapsed
   `<details>`. Images are not pane screenshots: they are derived from the hashed log,
   so they can always be regenerated and never disagree with it. Each render rebuilds
-  `evidence/`.
+  `evidence/` in a staging folder and swaps it in only once every image is drawn, so a
+  failed render leaves the previous report and its images intact.
 
 ## Hard limits (enforced on every `exec`)
 

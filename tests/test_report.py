@@ -143,22 +143,39 @@ def test_long_entry_cited_whole_is_capped(tmp_path, monkeypatch):
 # ------------------------------------------------------------------ image evidence
 
 
-@pytest.fixture
-def fake_freeze(monkeypatch):
-    """Replace freeze: record the lines each image is drawn from, write a stub PNG."""
-    drawn: dict[str, list[str]] = {}
+class FakeDrawer:
+    """Stands in for freeze: records the lines each image is drawn from, writes a stub PNG.
 
-    def render_png(lines, dest):
-        drawn[dest.name] = list(lines)
+    ``fail_on`` names an image whose drawing fails, to exercise partial failures.
+    """
+
+    def __init__(self, fail_on: str | None = None, available: bool = True):
+        self.drawn: dict[str, list[str]] = {}
+        self.fail_on = fail_on
+        self.available = available
+
+    def check(self):
+        if not self.available:
+            raise evidence.EvidenceError("no drawer")
+
+    def draw(self, lines, dest):
+        if dest.name == self.fail_on:
+            raise evidence.EvidenceError(f"draw failed for {dest.name}")
+        self.drawn[dest.name] = list(lines)
         dest.write_bytes(b"\x89PNG stub")
 
-    monkeypatch.setattr(evidence, "freeze_path", lambda: "/usr/bin/true")
-    monkeypatch.setattr(evidence, "render_png", render_png)
-    return drawn
+
+@pytest.fixture
+def drawer():
+    return FakeDrawer()
 
 
-def test_image_evidence(qa_dir, fake_freeze):
-    path, warnings = report.render_report(qa_dir, VERDICTS, mode="image")
+def images(d):
+    return sorted(p.name for p in (d / "evidence").iterdir())
+
+
+def test_image_evidence(qa_dir, drawer):
+    path, warnings = report.render_report(qa_dir, VERDICTS, mode="image", drawer=drawer)
     assert warnings == ANOMALIES
     md = path.read_text()
     assert "![#2](evidence/T1-1.png)" in md
@@ -167,60 +184,88 @@ def test_image_evidence(qa_dir, fake_freeze):
     assert f"$ {POST}\n201\n" not in md  # no text blocks in image mode
     assert "### 🤖 #2 · " in md  # headings stay text
     assert "Images in evidence/ are rendered from the same lines" in md
-    assert sorted(p.name for p in (qa_dir / "evidence").iterdir()) == ["T1-1.png", "T1-2.png", "T1-3.png"]
+    assert images(qa_dir) == ["T1-1.png", "T1-2.png", "T1-3.png"]
+    assert sorted(p.name for p in qa_dir.iterdir() if p.name.startswith(".evidence")) == []
     # The image is drawn from exactly the lines the text block would show.
-    assert fake_freeze["T1-3.png"] == ["$ psql -c 'select count(*) from transfers'", " count", "-------", "     2"]
-    assert fake_freeze["T1-1.png"] == [f"$ {POST}", "201"]
+    assert drawer.drawn["T1-3.png"] == ["$ psql -c 'select count(*) from transfers'", " count", "-------", "     2"]
+    assert drawer.drawn["T1-1.png"] == [f"$ {POST}", "201"]
 
 
-def test_both_evidence(qa_dir, fake_freeze):
-    md = report.render_report(qa_dir, VERDICTS, mode="both")[0].read_text()
+def test_both_evidence(qa_dir, drawer):
+    md = report.render_report(qa_dir, VERDICTS, mode="both", drawer=drawer)[0].read_text()
     assert "![#5 lines 1-3](evidence/T1-3.png)\n\n<details><summary>text</summary>\n\n```\n$ psql" in md
     assert md.count("<details>") == 3
 
 
-def test_text_mode_writes_no_images(qa_dir, fake_freeze):
-    md = report.render_report(qa_dir, VERDICTS)[0].read_text()
-    assert "![" not in md and not (qa_dir / "evidence").exists() and fake_freeze == {}
+def test_text_mode_writes_no_images(qa_dir, drawer):
+    md = report.render_report(qa_dir, VERDICTS, drawer=drawer)[0].read_text()
+    assert "![" not in md and not (qa_dir / "evidence").exists() and drawer.drawn == {}
 
 
-def test_rerender_removes_stale_images(qa_dir, fake_freeze):
-    report.render_report(qa_dir, VERDICTS, mode="image")
+def test_rerender_removes_stale_images(qa_dir, drawer):
+    report.render_report(qa_dir, VERDICTS, mode="image", drawer=drawer)
     fewer = json.loads(json.dumps(VERDICTS))
     fewer["tests"][0]["evidence"] = [2]
-    report.render_report(qa_dir, fewer, mode="image")
-    assert [p.name for p in (qa_dir / "evidence").iterdir()] == ["T1-1.png"]
+    report.render_report(qa_dir, fewer, mode="image", drawer=drawer)
+    assert images(qa_dir) == ["T1-1.png"]
 
 
-def test_duplicate_test_ids_do_not_overwrite_images(qa_dir, fake_freeze):
+def test_failed_draw_keeps_previous_report_and_images(qa_dir, drawer):
+    """A drawer failing partway must not leave the old report linking to deleted images."""
+    path, _ = report.render_report(qa_dir, VERDICTS, mode="image", drawer=drawer)
+    before_md = path.read_text()
+    with pytest.raises(evidence.EvidenceError, match="T1-2.png"):
+        report.render_report(qa_dir, VERDICTS, mode="image", drawer=FakeDrawer(fail_on="T1-2.png"))
+    assert path.read_text() == before_md
+    assert images(qa_dir) == ["T1-1.png", "T1-2.png", "T1-3.png"]
+    assert not (qa_dir / evidence.STAGING_DIR).exists()
+
+
+def test_failed_first_image_render_leaves_no_folder(qa_dir):
+    with pytest.raises(evidence.EvidenceError):
+        report.render_report(qa_dir, VERDICTS, mode="image", drawer=FakeDrawer(fail_on="T1-1.png"))
+    assert not (qa_dir / "evidence").exists() and not (qa_dir / report.REPORT_NAME).exists()
+    assert not (qa_dir / evidence.STAGING_DIR).exists()
+
+
+def test_duplicate_test_ids_do_not_overwrite_images(qa_dir, drawer):
     t = {"goal": "g", "expected": "e", "verdict": "pass"}
     dup = {"tests": [{**t, "id": "T 1/a", "evidence": [2]}, {**t, "id": "T 1/a", "evidence": [4]}]}
-    md = report.render_report(qa_dir, dup, mode="image")[0].read_text()
+    md = report.render_report(qa_dir, dup, mode="image", drawer=drawer)[0].read_text()
     assert "(evidence/T_1_a-1.png)" in md and "(evidence/T_1_a_2-1.png)" in md
 
 
-def test_tall_image_warns(tmp_path, fake_freeze, monkeypatch):
+def test_tall_image_warns(tmp_path, drawer, monkeypatch):
     monkeypatch.setenv("QA_BOT_IMAGE_MAX_LINES", "3")
     out = b"".join(b"line %d\r\n" % i for i in range(1, 6))
     d = make_dir(tmp_path, entry(1, "kubectl logs x", out), [{"id": 1, "command": "kubectl logs x"}])
     t = {"id": "T1", "goal": "g", "expected": "e", "verdict": "pass"}
-    _, warnings = report.render_report(d, {"tests": [{**t, "evidence": [1]}]}, mode="image")
-    assert any("T1: #1 shows 5 lines" in w for w in warnings)
-    _, warnings = report.render_report(d, {"tests": [{**t, "evidence": [{"entry": 1, "lines": "2-3"}]}]}, mode="image")
+    path, warnings = report.render_report(d, {"tests": [{**t, "evidence": [1]}]}, mode="image", drawer=drawer)
+    tall = "T1: #1 is 6 lines as an image; over 3 lines is hard to read. Cite a narrower line range."
+    assert warnings == [tall]
+    assert f"> - {tall}" in path.read_text()  # warnings found while drawing still reach the header
+    lines = {"entry": 1, "lines": "2-3"}
+    _, warnings = report.render_report(d, {"tests": [{**t, "evidence": [lines]}]}, mode="image", drawer=drawer)
     assert warnings == []
 
 
 def test_unknown_mode_is_rejected(qa_dir):
-    with pytest.raises(report.ReportError, match="evidence must be one of"):
+    with pytest.raises(evidence.EvidenceError, match="evidence must be one of"):
         report.render_report(qa_dir, VERDICTS, mode="png")
+    assert not (qa_dir / "verdicts.json").exists()
 
 
-def test_missing_freeze_fails_before_writing(qa_dir, monkeypatch):
-    monkeypatch.setattr(evidence.shutil, "which", lambda _: None)
-    with pytest.raises(evidence.EvidenceError, match="freeze"):
-        report.render_report(qa_dir, VERDICTS, mode="image")
+def test_unavailable_drawer_fails_before_writing(qa_dir):
+    with pytest.raises(evidence.EvidenceError, match="no drawer"):
+        report.render_report(qa_dir, VERDICTS, mode="image", drawer=FakeDrawer(available=False))
     assert not (qa_dir / report.REPORT_NAME).exists()
     assert not (qa_dir / "verdicts.json").exists()
+
+
+def test_freeze_missing_from_path_is_reported(monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    with pytest.raises(evidence.EvidenceError, match="needs freeze"):
+        evidence.Freeze().check()
 
 
 @pytest.mark.skipif(not shutil.which("freeze"), reason="freeze not installed")
@@ -371,11 +416,11 @@ def test_unknown_poll_is_warned(poll_dir):
     assert "T1: cites poll P7, which is not in the session index." in warnings
 
 
-def test_poll_image_evidence(poll_dir, fake_freeze):
-    path, _ = report.render_report(poll_dir, _poll_verdicts([5]), "both")
+def test_poll_image_evidence(poll_dir, drawer):
+    path, _ = report.render_report(poll_dir, _poll_verdicts([5]), "both", drawer=drawer)
     md = path.read_text()
     assert "![poll P1 #2-#5](evidence/T1-1.png)" in md
-    assert fake_freeze["T1-1.png"] == POLL_BLOCK[2:-1]
+    assert drawer.drawn["T1-1.png"] == POLL_BLOCK[2:-1]
 
 
 def test_single_attempt_poll(tmp_path):
