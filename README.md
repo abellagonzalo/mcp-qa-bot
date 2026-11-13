@@ -142,8 +142,9 @@ claude mcp add qa-bot -- /path/to/mcp-qa-bot/.venv/bin/python /path/to/mcp-qa-bo
 ln -s /path/to/mcp-qa-bot/skills/manual-qa ~/.claude/skills/manual-qa
 ```
 
-Then ask Claude to "QA PAY-123 on staging" and attach to the session it opens with the
-`tmux attach -t …` command it prints.
+Then start it with `/manual-qa <ticket or PR>` (for example `/manual-qa PAY-123 staging`)
+and attach to the session it opens with the `tmux attach -t …` command it prints. The
+skill is slash-command only, so Claude never starts a QA session on its own.
 
 MCP Inspector:
 

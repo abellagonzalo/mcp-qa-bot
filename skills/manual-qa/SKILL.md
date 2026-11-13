@@ -1,6 +1,8 @@
 ---
 name: manual-qa
-description: Manually test a change on dev or staging the way a person would — real endpoints, real database, real logs — with a recorded terminal session and a rendered QA report as proof. Use when the user asks to QA, manually test, or verify a ticket/PR on dev or staging. Requires the qa-bot MCP server (open_session, exec, poll, peek, interrupt, close_session, render_report).
+description: Manually test a PR or ticket on dev or staging the way a person would — real endpoints, real database, real logs. Reads the change, plans the tests with a danger review, waits for your approval, then runs them in a tmux session you can watch and renders a QA report as proof. Needs the qa-bot MCP server.
+argument-hint: "[PR or ticket] [staging|dev]"
+disable-model-invocation: true
 ---
 
 # Manual QA
