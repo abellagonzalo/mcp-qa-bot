@@ -9,6 +9,7 @@ import time
 import pytest
 
 from qa_bot import report, session
+from qa_bot.policy import Policy, Refused
 
 pytestmark = pytest.mark.skipif(
     not (shutil.which("tmux") and shutil.which("zsh")), reason="needs tmux and zsh"
@@ -30,7 +31,9 @@ def qa(tmp_path, monkeypatch):
     zdot = tmp_path / "zdot"
     zdot.mkdir()
     (zdot / ".zshrc").write_text(ZSHRC)
-    s = session.Session.open("it", tmp_path / "report", extra_env={"ZDOTDIR": str(zdot)})
+    # No kube lookup: the developer's own current kube context must not affect the test.
+    policy = Policy(kube_lookup=lambda env: {})
+    s = session.Session.open("it", tmp_path / "report", extra_env={"ZDOTDIR": str(zdot)}, policy=policy)
     yield s
     subprocess.run(["tmux", "-L", socket, "kill-server"], capture_output=True)
 
@@ -125,14 +128,14 @@ def test_multiline_loop_and_poll(qa):
 
     state = qa.dir / "inputs" / "state.txt"
     state.write_text("PENDING\n")
-    calls = []
+    sleeps = []
 
-    def before_attempt():
-        calls.append(1)
-        if len(calls) == 3:
+    def sleep(seconds):  # runs between attempts: the state flips before attempt 3
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
             state.write_text("PROCESSED\n")
 
-    p = qa.poll("cat inputs/state.txt", "PROCESSED", 0.2, 5, 10, before_attempt)
+    p = qa.poll("cat inputs/state.txt", "PROCESSED", 0.2, 5, 10, sleep=sleep)
     assert (p.poll_id, p.outcome, p.entry_ids) == (1, "matched", [2, 3, 4])
     assert p.attempts[-1].output == ["PROCESSED"]
 
@@ -159,3 +162,21 @@ def test_multiline_loop_and_poll(qa):
     assert "### 🤖 #2–#4 · " in md and "polled 3× over" in md and "until /PROCESSED/ (matched)" in md
     assert "[attempt 1 · " in md and "[attempt 3 · " in md and "[attempt 2 · " not in md
     assert "$ for i in 1 2 3; do\n  echo \"n=$i\"\ndone\nn=1\nn=2\nn=3" in md
+
+
+def test_policy_sees_env_the_human_sets_in_the_pane(qa):
+    assert qa.exec("echo before", timeout=10).entry_id == 1
+    human_types(qa, "export PGHOST=payments.prod.rds")
+    wait_state(qa, "idle")
+    deadline = time.monotonic() + 5  # the hooks publish the env at the next prompt
+    while "PGHOST" not in (qa.pane_env_path().read_text() if qa.pane_env_path().exists() else ""):
+        assert time.monotonic() < deadline, "hooks never published PGHOST"
+        time.sleep(0.05)
+    with pytest.raises(Refused, match="PGHOST"):
+        qa.exec("echo after", timeout=10)
+    with pytest.raises(Refused, match="PGHOST"):
+        qa.poll("echo after", "x", 0.1, 2, 10)
+    assert qa.polls == []
+    qa.close()
+    idx = json.loads((qa.dir / session.INDEX_NAME).read_text())["execs"]
+    assert [e["command"] for e in idx] == ["echo before"]

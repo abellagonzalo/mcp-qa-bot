@@ -60,6 +60,10 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
 
 ## Hard limits (enforced on every `exec`)
 
+One exec policy (`qa_bot/policy.py`) checks every agent command right before it is
+typed, inside the session itself, so no code path types an unchecked agent command.
+A refusal raises `Refused` with a reason, and nothing is typed or recorded.
+
 - Any executable may run. There is no allowlist: the approval gate in the skill and the
   production guard are the safety boundary. Which tools to use is guidance (see
   [Preferred tools](#preferred-tools)).

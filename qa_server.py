@@ -30,8 +30,8 @@ from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
-from qa_bot import report, safety, tools
-from qa_bot.limits import CommandNotAllowed, validate_command
+from qa_bot import report, tools
+from qa_bot.policy import Refused
 from qa_bot.session import Session, SessionError
 
 MAX_TIMEOUT = 1800.0
@@ -55,13 +55,6 @@ def _require_session() -> Session:
     if _session is None or _session.closed:
         raise SessionError("No open session. Call open_session first.")
     return _session
-
-
-def _check_production(session: Session, command: str) -> None:
-    """Refuse if the command or the pane's kube/DB context looks like production."""
-    pane_env = safety.read_pane_env(session.pane_env_path())
-    kube = safety.kube_context(pane_env)
-    safety.check_not_production(command, pane_env, kube)
 
 
 def _wait(timeout: float | None) -> float:
@@ -154,8 +147,6 @@ async def exec_command(command: str, timeout: float | None = None) -> str:
     """
     async with _lock:
         session = _require_session()
-        validate_command(command)
-        await asyncio.to_thread(_check_production, session, command)
         wait = _wait(timeout)
         result = await asyncio.to_thread(session.exec, command, wait)
 
@@ -217,17 +208,8 @@ async def poll(
     max_attempts = max(1, min(int(max_attempts), MAX_POLL_ATTEMPTS))
     async with _lock:
         session = _require_session()
-        validate_command(command)
         wait = _wait(timeout)
-        result = await asyncio.to_thread(
-            session.poll,
-            command,
-            until,
-            interval,
-            max_attempts,
-            wait,
-            lambda: _check_production(session, command),
-        )
+        result = await asyncio.to_thread(session.poll, command, until, interval, max_attempts, wait)
 
     ids = result.entry_ids
     entries = ", ".join(f"#{i}" for i in ids) or "none"
@@ -330,4 +312,4 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["CommandNotAllowed", "mcp", "main"]
+__all__ = ["Refused", "mcp", "main"]

@@ -1,6 +1,19 @@
+import re
+
 import pytest
 
-from qa_bot.limits import CommandNotAllowed, validate_command
+from qa_bot.policy import Policy, Refused, read_pane_env
+
+
+def no_kube(pane_env):
+    return {}
+
+
+def check(command, pane_env=None, kube=None):
+    Policy(kube_lookup=lambda env: kube or {}).check(command, pane_env or {})
+
+
+# ------------------------------------------------------------------ hard limits
 
 
 @pytest.mark.parametrize(
@@ -43,7 +56,7 @@ from qa_bot.limits import CommandNotAllowed, validate_command
     ],
 )
 def test_allowed(cmd):
-    validate_command(cmd)
+    check(cmd)
 
 
 @pytest.mark.parametrize(
@@ -92,5 +105,70 @@ def test_allowed(cmd):
     ],
 )
 def test_rejected(cmd):
-    with pytest.raises(CommandNotAllowed):
-        validate_command(cmd)
+    with pytest.raises(Refused):
+        check(cmd)
+
+
+# ------------------------------------------------------------- production guard
+
+
+@pytest.mark.parametrize(
+    "command,env,kube",
+    [
+        ("kubectl --context prod-eu get pods", {}, {}),
+        ("curl https://payments.production.internal/v1", {}, {}),
+        ("psql -h db-prd.internal", {}, {}),
+        ("kubectl get pods", {}, {"context": "eu-prod1"}),
+        ("kubectl get pods", {}, {"server": "https://k8s.prod.internal"}),
+        ("psql -c 'select 1'", {"PGHOST": "payments.prod.rds"}, {}),
+        ("psql", {"DATABASE_URL": "postgres://u:secret@db.prod/x"}, {}),
+    ],
+)
+def test_production_refused(command, env, kube):
+    with pytest.raises(Refused) as exc:
+        check(command, env, kube)
+    assert "secret" not in str(exc.value)
+    assert str(exc.value) == f"Refused: {exc.value.reason}"
+
+
+@pytest.mark.parametrize(
+    "command,env,kube",
+    [
+        ("curl https://x.staging.internal/v1/products", {}, {}),
+        ("kubectl get pods", {"PGHOST": "db.staging"}, {"context": "staging-eu", "namespace": "payments"}),
+        ("curl https://x.dev/health/live", {}, {}),
+        ("kubectl get pods", {}, {}),
+    ],
+)
+def test_non_production_allowed(command, env, kube):
+    check(command, env, kube)
+
+
+def test_kube_lookup_gets_the_pane_env():
+    seen = []
+    Policy(kube_lookup=lambda env: seen.append(env) or {}).check("kubectl get pods", {"KUBECONFIG": "/k"})
+    assert seen == [{"KUBECONFIG": "/k"}]
+
+
+@pytest.mark.parametrize("command", ["kubectl get $(whoami)", "kubectl --context prod get pods"])
+def test_text_refusals_skip_the_kube_lookup(command):
+    def boom(env):
+        raise AssertionError("kube lookup should not run")
+
+    with pytest.raises(Refused):
+        Policy(kube_lookup=boom).check(command, {})
+
+
+def test_prod_pattern_is_configurable(monkeypatch):
+    monkeypatch.setenv("QA_BOT_PROD_PATTERN", r"\blive\b")
+    with pytest.raises(Refused):
+        Policy(kube_lookup=no_kube).check("curl https://api.live.example", {})
+    Policy(kube_lookup=no_kube).check("curl https://api.prod.example", {})
+    Policy(kube_lookup=no_kube, prod_pattern=re.compile("x9")).check("curl https://api.prod.example", {})
+
+
+def test_read_pane_env(tmp_path):
+    f = tmp_path / "env"
+    f.write_text("PGHOST=db.staging\nPGSERVICE=\nKUBECONFIG=/a=b\njunk\n")
+    assert read_pane_env(f) == {"PGHOST": "db.staging", "KUBECONFIG": "/a=b"}
+    assert read_pane_env(tmp_path / "missing") == {}

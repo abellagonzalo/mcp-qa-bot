@@ -5,7 +5,8 @@ Mechanics:
   and waits for the hooks' first ``tmux wait-for`` signal (the user's .zshrc has
   finished loading and the hooks are active). Only then ``pipe-pane`` starts
   streaming the pane into ``session.log``, so the ``source`` line is not recorded.
-- ``exec`` pastes the command into the pane (bracketed paste, so ``;`` and heredocs
+- ``exec`` checks the command against the exec policy (``policy.py``; refusals raise
+  ``Refused`` and nothing is typed), then pastes the command into the pane (bracketed paste, so ``;`` and heredocs
   arrive exactly as written), presses Enter and waits on ``tmux wait-for`` until the
   hooks report that this command finished.
 - ``poll`` runs ``exec`` once per attempt until the output matches a regex; every
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import transcript
+from .policy import Policy, read_pane_env
 
 HOOKS = Path(__file__).with_name("hooks.zsh")
 LOG_NAME = "session.log"
@@ -150,6 +152,7 @@ class Session:
     index: list[dict] = field(default_factory=list)
     polls: list[dict] = field(default_factory=list)
     closed: bool = False
+    policy: Policy = field(default_factory=Policy)
 
     # ---------------------------------------------------------------- paths
 
@@ -170,7 +173,13 @@ class Session:
     # ------------------------------------------------------------ lifecycle
 
     @classmethod
-    def open(cls, name: str, directory: str | Path, extra_env: dict[str, str] | None = None) -> "Session":
+    def open(
+        cls,
+        name: str,
+        directory: str | Path,
+        extra_env: dict[str, str] | None = None,
+        policy: Policy | None = None,
+    ) -> "Session":
         session_name = slug(name)
         directory = Path(directory).expanduser().resolve()
         if (directory / LOG_NAME).exists():
@@ -185,7 +194,7 @@ class Session:
         (directory / "inputs").mkdir(exist_ok=True)
         runtime = Path(tempfile.mkdtemp(prefix=f"mcp-qa-bot-{session_name}-"))
         channel = f"qa-bot-{session_name}-{secrets.token_hex(4)}"
-        session = cls(session_name, directory, runtime, channel)
+        session = cls(session_name, directory, runtime, channel, policy=policy or Policy())
 
         env_args: list[str] = []
         for key, value in (extra_env or {}).items():
@@ -261,7 +270,19 @@ class Session:
         tmux("paste-buffer", "-b", self.channel, "-d", "-p", "-t", self.target)
         tmux("send-keys", "-t", self.target, "Enter")
 
-    def exec(self, command: str, timeout: float, poll_id: int | None = None) -> ExecResult:
+    def _check(self, command: str) -> None:
+        """Refuse (``policy.Refused``) unless the policy allows the command in the pane's current context."""
+        self.policy.check(command, read_pane_env(self.pane_env_path()))
+
+    def exec(self, command: str, timeout: float) -> ExecResult:
+        """Check the command against the policy, type it, and wait until it finishes."""
+        if self.closed:
+            raise SessionError("Session is closed.")
+        self._check(command)
+        return self._run(command, timeout)
+
+    def _run(self, command: str, timeout: float, poll_id: int | None = None) -> ExecResult:
+        """Type an already-checked command and wait until it finishes."""
         if self.closed:
             raise SessionError("Session is closed.")
         state = self.state()
@@ -317,18 +338,22 @@ class Session:
         interval: float,
         max_attempts: int,
         timeout: float,
-        before_attempt: Callable[[], None] = lambda: None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> PollResult:
         """Run ``command`` up to ``max_attempts`` times, ``interval`` seconds apart, until
         its output matches the ``until`` regex.
 
-        Each attempt goes through ``exec`` (one recorded entry each) after
-        ``before_attempt`` (the caller's per-attempt safety check, which may raise).
+        Every attempt is checked against the policy right before it is typed (the
+        context can change between attempts) and is one recorded entry. A refusal of
+        the first attempt raises before anything is recorded; a later refusal raises
+        with the group recorded as ``error``.
         Stops early when the pane is busy, an attempt times out or is interrupted
         (Ctrl-C). The group is recorded in the index whatever the outcome.
         """
+        if self.closed:
+            raise SessionError("Session is closed.")
         pattern = re.compile(until, re.M)
+        self._check(command)
         group = {
             "poll_id": len(self.polls) + 1,
             "command": command,
@@ -345,8 +370,8 @@ class Session:
         for n in range(max_attempts):
             if n:
                 sleep(interval)
-            before_attempt()
-            result = self.exec(command, timeout, poll_id=group["poll_id"])
+                self._check(command)
+            result = self._run(command, timeout, poll_id=group["poll_id"])
             if result.status == "BUSY":
                 outcome = "busy"
                 break
