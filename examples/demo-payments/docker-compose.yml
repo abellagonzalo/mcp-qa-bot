@@ -1,0 +1,31 @@
+# Made-up "payments" service + Postgres for demoing the manual-qa skill.
+#   docker-compose -f examples/demo-payments/docker-compose.yml up -d --wait
+# Service: http://localhost:8099   DB: postgresql://qa:qa@localhost:55432/payments
+name: qa-demo-payments
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: qa
+      POSTGRES_PASSWORD: qa
+      POSTGRES_DB: payments
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "qa", "-d", "payments"]
+      interval: 1s
+      retries: 30
+
+  payments:
+    image: python:3.13-slim
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      DATABASE_DSN: postgresql://qa:qa@db:5432/payments
+    volumes: ["./service.py:/app/service.py:ro"]
+    command: sh -c "pip install -q 'psycopg[binary]' && python -u /app/service.py"
+    ports: ["8099:8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 2s
+      retries: 60

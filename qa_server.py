@@ -1,248 +1,209 @@
 #!/usr/bin/env python3
-"""mcp-qa-bot: MCP server that runs QA commands in iTerm2 and screenshots the result.
+"""mcp-qa-bot: execution layer for agent-driven manual QA.
 
-Exposes one tool, ``execute_and_screenshot``, which:
-  1. validates the command against an allowlist,
-  2. brings iTerm2 to the foreground (AppleScript),
-  3. optionally clears the current session, then types the command into it,
-  4. waits for output to populate,
-  5. captures only the iTerm2 window with macOS ``screencapture -l <window id>``.
+Runs shell commands in a tmux pane a human can watch (and type in), records
+everything that runs there, and renders a report from verdicts it is given. It knows
+nothing about QA itself; the workflow lives in the QA skill (skills/manual-qa).
+
+Tools: open_session, exec, peek, interrupt, close_session, render_report.
 
 Configuration (environment variables):
-  QA_BOT_ALLOWED_COMMANDS  comma-separated executables allowed (default: kubectl,curl,psql)
-  QA_BOT_SCREENSHOT_DIR    where PNGs are written (default: ~/qa-screenshots)
-  QA_BOT_DEFAULT_WAIT      default seconds to wait for output (default: 3)
+  QA_BOT_ALLOWED_COMMANDS  comma-separated executables/aliases exec may run
+  QA_BOT_PROD_PATTERN      regex for production names (refused before every exec)
+  QA_BOT_DEFAULT_TIMEOUT   seconds exec waits for a command (default 60)
+  QA_BOT_EXEC_MAX_LINES    output lines exec returns to the agent (default 300)
+  QA_BOT_REPORT_MAX_LINES  lines shown when an entry is cited without a range (default 200)
+  QA_BOT_TMUX_SOCKET       tmux socket name (-L); default: the user's default server
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import re
-import shlex
-import subprocess
-from datetime import datetime
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 
-DEFAULT_ALLOWED = ("kubectl", "curl", "psql")
-MAX_WAIT_SECONDS = 300.0
-CONTROL_OPERATORS = {"|", "||", "&&", ";", "&", "|&", ";;"}
-REDIRECT_TOKENS = {">", ">>", ">&", "&>", "&>>", ">|"}
-ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+from qa_bot import report, safety
+from qa_bot.allowlist import CommandNotAllowed, allowed_commands, validate_command
+from qa_bot.session import Session, SessionError
+
+MAX_TIMEOUT = 1800.0
 
 mcp = FastMCP("mcp-qa-bot")
+_lock = asyncio.Lock()
+_session: Session | None = None
+_last_dir: Path | None = None
 
 
-# --------------------------------------------------------------------------- config
-
-
-def allowed_commands() -> set[str]:
-    raw = os.environ.get("QA_BOT_ALLOWED_COMMANDS")
-    if not raw:
-        return set(DEFAULT_ALLOWED)
-    return {c.strip() for c in raw.split(",") if c.strip()}
-
-
-def screenshot_dir() -> Path:
-    path = Path(os.environ.get("QA_BOT_SCREENSHOT_DIR", "~/qa-screenshots")).expanduser()
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def default_wait() -> float:
+def _env_number(name: str, default: float) -> float:
     try:
-        return float(os.environ.get("QA_BOT_DEFAULT_WAIT", "3"))
+        return float(os.environ.get(name, default))
     except ValueError:
-        return 3.0
+        return default
 
 
-# ------------------------------------------------------------------------ allowlist
+def _require_session() -> Session:
+    if _session is None or _session.closed:
+        raise SessionError("No open session. Call open_session first.")
+    return _session
 
 
-class CommandNotAllowed(ValueError):
-    pass
+def _numbered(lines: list[str], max_lines: int) -> str:
+    """Output with entry line numbers (what verdicts cite), tail-capped for the agent."""
+    if not lines:
+        return "(no output)"
+    width = len(str(len(lines)))
+    start = max(0, len(lines) - max_lines)
+    body = [f"{i:>{width}}│ {line}" for i, line in enumerate(lines[start:], start + 1)]
+    if start:
+        body.insert(0, f"… lines 1-{start} omitted here (still in the log; use peek or cite ranges)")
+    return "\n".join(body)
 
 
-def validate_command(command: str, allowed: set[str]) -> None:
-    """Raise CommandNotAllowed unless every command in the pipeline is allowlisted.
-
-    Pipes and ``&&``/``;`` chains are permitted as long as each segment starts with an
-    allowed executable. Command substitution, newlines and output redirection are
-    rejected outright because they can run or write things the allowlist can't see.
-    """
-    if not command.strip():
-        raise CommandNotAllowed("Command is empty.")
-    if "\n" in command or "\r" in command:
-        raise CommandNotAllowed("Multi-line commands are not allowed.")
-    if "$(" in command or "`" in command or "<(" in command or ">(" in command:
-        raise CommandNotAllowed("Command/process substitution is not allowed.")
-
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    try:
-        tokens = list(lexer)
-    except ValueError as exc:  # unbalanced quotes etc.
-        raise CommandNotAllowed(f"Could not parse command: {exc}") from exc
-
-    segments: list[list[str]] = [[]]
-    for tok in tokens:
-        if tok in CONTROL_OPERATORS:
-            segments.append([])
-        elif tok in REDIRECT_TOKENS:
-            raise CommandNotAllowed("Output redirection is not allowed.")
-        else:
-            segments[-1].append(tok)
-
-    for seg in segments:
-        # Skip leading VAR=value assignments, e.g. `KUBECONFIG=x kubectl ...`.
-        i = 0
-        while i < len(seg) and ENV_ASSIGNMENT.match(seg[i]):
-            i += 1
-        words = seg[i:]
-        if not words:
-            raise CommandNotAllowed("Empty command segment (dangling operator?).")
-        exe = os.path.basename(words[0])
-        if exe not in allowed:
-            raise CommandNotAllowed(
-                f"'{exe}' is not in the allowlist ({', '.join(sorted(allowed))}). "
-                "Extend it with QA_BOT_ALLOWED_COMMANDS."
-            )
-
-
-# ------------------------------------------------------------------------ macOS glue
-
-# The command is passed as argv to avoid any AppleScript string escaping issues.
-_RUN_IN_ITERM = """
-on run argv
-    set theCommand to item 1 of argv
-    set shouldClear to (item 2 of argv) is "1"
-    tell application "iTerm2"
-        activate
-        if (count of windows) is 0 then
-            create window with default profile
-            delay 0.5
-        end if
-        tell current session of current window
-            if shouldClear then
-                write text "clear"
-                delay 0.3
-            end if
-            write text theCommand
-        end tell
-        return id of current window
-    end tell
-end run
-"""
-
-_READ_SESSION_TEXT = """
-tell application "iTerm2"
-    return contents of current session of current window
-end tell
-"""
-
-
-def _osascript(script: str, *args: str) -> str:
-    result = subprocess.run(
-        ["osascript", "-", *args],
-        input=script,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"AppleScript failed: {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
-def run_in_iterm(command: str, clear: bool) -> str:
-    """Type ``command`` into the active iTerm2 session; return the window id."""
-    return _osascript(_RUN_IN_ITERM, command, "1" if clear else "0")
-
-
-def read_session_text(max_lines: int) -> str:
-    try:
-        text = _osascript(_READ_SESSION_TEXT)
-    except RuntimeError:
-        return ""
-    lines = text.rstrip().splitlines()
-    return "\n".join(lines[-max_lines:])
-
-
-def capture_window(window_id: str, dest: Path) -> None:
-    # -l: capture a specific window, -o: no window shadow, -x: no shutter sound
-    result = subprocess.run(
-        ["screencapture", "-x", "-o", "-l", window_id, str(dest)],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if result.returncode != 0 or not dest.exists():
-        raise RuntimeError(
-            f"screencapture failed (window {window_id}): {result.stderr.strip() or 'no file written'}. "
-            "Make sure the app running this server has Screen Recording permission."
-        )
-
-
-def _slug(text: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower()
-    return slug[:60] or "qa"
-
-
-# ----------------------------------------------------------------------------- tool
+# ---------------------------------------------------------------------- tools
 
 
 @mcp.tool()
-async def execute_and_screenshot(
-    command: str,
-    wait_seconds: float | None = None,
-    label: str | None = None,
-    clear_screen: bool = True,
-    include_image: bool = False,
-    output_lines: int = 60,
-) -> list:
-    """Run a QA command (kubectl, curl, psql, ...) in iTerm2 and screenshot the window as proof.
-
-    The command is typed into the active iTerm2 session, so kube context, env vars and
-    open psql sessions are preserved between calls.
+async def open_session(name: str, dir: str) -> str:
+    """Start a recorded QA session: a tmux session running the user's own zsh.
 
     Args:
-        command: Shell command to run. Every executable in it must be allowlisted.
-        wait_seconds: Seconds to wait for output before capturing (default from
-            QA_BOT_DEFAULT_WAIT, 3s). Increase for slow commands.
-        label: Short description used in the screenshot filename, e.g. "pods-ready".
-        clear_screen: Run `clear` first so the screenshot shows only this command.
-            Set false when inside an interactive prompt such as psql.
-        include_image: Also return the PNG inline so it can be viewed directly.
-        output_lines: How many trailing lines of terminal text to return.
+        name: Session name (also the tmux session name), e.g. "pay-123".
+        dir: Report folder. session.log, the index, hash, shots/ and qa-report.md go
+            here; put test inputs in <dir>/inputs/. Use a fresh folder per session.
 
-    Returns the screenshot path and the visible terminal text (plus the image if requested).
+    Returns the session id, the `tmux attach` command for the human, and the folder.
     """
-    validate_command(command, allowed_commands())
+    global _session, _last_dir
+    async with _lock:
+        if _session is not None and not _session.closed:
+            raise SessionError(f"Session '{_session.name}' is still open. Close it first.")
+        _session = await asyncio.to_thread(Session.open, name, dir)
+        _last_dir = _session.dir
+        return (
+            f"Session: {_session.name}\n"
+            f"Watch / type along: {_session.attach_command}\n"
+            f"Folder: {_session.dir}\n"
+            "Recording started."
+        )
 
-    wait = default_wait() if wait_seconds is None else wait_seconds
-    wait = max(0.0, min(wait, MAX_WAIT_SECONDS))
 
-    window_id = await asyncio.to_thread(run_in_iterm, command, clear_screen)
-    await asyncio.sleep(wait)
+@mcp.tool(name="exec")
+async def exec_command(command: str, timeout: float | None = None, screenshot: bool = False) -> list:
+    """Type a command into the session's pane exactly as written and wait until it finishes.
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    dest = screenshot_dir() / f"{timestamp}-{_slug(label or command)}.png"
-    await asyncio.to_thread(capture_window, window_id, dest)
+    Use literal values (full URL, ids, payloads) so the command itself is the proof.
+    Split long commands over lines with trailing '\\' continuations; multi-line SQL goes
+    in one heredoc, e.g. psql ... <<'SQL' / ... / SQL.
 
-    terminal_text = await asyncio.to_thread(read_session_text, max(1, output_lines))
+    Refused (hard limits): executables not on the allowlist, $(...)/backticks, output
+    redirection (except 2>&1 and >/dev/null), background jobs (&, nohup, disown),
+    TRUNCATE/DROP, DELETE/UPDATE without WHERE, and anything while the command, the kube
+    context or the pane's database env looks like production.
 
-    summary = (
-        f"Screenshot saved: {dest}\n"
-        f"Command: {command}\n"
-        f"Waited: {wait:g}s\n\n"
-        f"--- terminal output (last {output_lines} lines) ---\n{terminal_text}"
-    )
-    content: list = [summary]
-    if include_image:
-        content.append(Image(path=str(dest)))
+    Args:
+        command: Shell command (aliases are fine if they are on the allowlist).
+        timeout: Seconds to wait for the command to finish (default 60).
+        screenshot: Also render the pane as <dir>/shots/<id>.png.
+
+    Returns the log entry id (#N, cite it in verdicts), exit code, duration and the
+    numbered output lines. TIMEOUT returns the partial output (the command keeps
+    running: peek or interrupt). BUSY means a command is running or the human is
+    typing in the pane; nothing was typed.
+    """
+    async with _lock:
+        session = _require_session()
+        validate_command(command, allowed_commands())
+        pane_env = safety.read_pane_env(session.pane_env_path())
+        kube = await asyncio.to_thread(safety.kube_context, pane_env)
+        safety.check_not_production(command, pane_env, kube)
+
+        wait = _env_number("QA_BOT_DEFAULT_TIMEOUT", 60) if timeout is None else timeout
+        wait = max(1.0, min(float(wait), MAX_TIMEOUT))
+        result = await asyncio.to_thread(session.exec, command, wait, screenshot)
+
+    max_lines = int(_env_number("QA_BOT_EXEC_MAX_LINES", 300))
+    if result.status == "BUSY":
+        return [
+            "BUSY: a command is running or the prompt is not empty (the human may be typing). "
+            "Nothing was typed. Pane:\n" + "\n".join(result.output)
+        ]
+    if result.entry_id is None:
+        return [
+            f"TIMEOUT after {wait:g}s: no start marker seen (hooks broken or input not accepted). "
+            "Pane:\n" + "\n".join(result.output)
+        ]
+    header = f"#{result.entry_id}"
+    if result.status == "TIMEOUT":
+        header = f"TIMEOUT after {wait:g}s · {header} still running (peek / interrupt)"
+    else:
+        header += f" · exit {result.exit_code} · {result.duration_ms} ms"
+    if result.screenshot:
+        header += f"\nScreenshot: {result.screenshot}"
+    content: list = [f"{header}\n{_numbered(result.output, max_lines)}"]
+    if result.screenshot:
+        content.append(Image(path=str(result.screenshot)))
     return content
+
+
+@mcp.tool()
+async def peek(lines: int = 40) -> str:
+    """Show the pane's recent contents and whether it is busy, idle or being typed in."""
+    session = _require_session()
+    text = await asyncio.to_thread(session.peek, max(1, min(lines, 2000)))
+    return f"State: {session.state()}\n{text}"
+
+
+@mcp.tool()
+async def interrupt() -> str:
+    """Send Ctrl-C to the pane. Returns whether it is now busy or idle."""
+    session = _require_session()
+    state = await asyncio.to_thread(session.interrupt)
+    return f"Sent Ctrl-C. State: {state}"
+
+
+@mcp.tool()
+async def close_session(keep_tmux: bool = False) -> str:
+    """Stop recording; write session.index.json and session.log.sha256.
+
+    Args:
+        keep_tmux: Leave the tmux session running (it is no longer recorded).
+    """
+    async with _lock:
+        session = _require_session()
+        log_hash, count = await asyncio.to_thread(session.close, not keep_tmux)
+        return (
+            f"Log: {session.log_path}\n"
+            f"Entries: {count}\n"
+            f"sha256: {log_hash}"
+        )
+
+
+@mcp.tool()
+async def render_report(verdicts: dict | None = None, dir: str | None = None) -> str:
+    """Validate verdicts against the closed log and render <dir>/qa-report.md.
+
+    Args:
+        verdicts: The verdicts object. If given it is written to <dir>/verdicts.json;
+            otherwise <dir>/verdicts.json is read. Shape:
+            {"ticket", "env", "build", "tests": [{"id", "goal", "input", "expected",
+            "verdict": "pass|fail|skipped", "actual", "note",
+            "evidence": [2, {"entry": 4, "lines": "1-3"}]}]}
+        dir: Session folder (default: the last session opened).
+
+    Fails if session.log or the index changed after close_session. Returns the report
+    path and validation warnings; fix them and render again.
+    """
+    directory = Path(dir).expanduser() if dir else _last_dir
+    if directory is None:
+        raise SessionError("No session folder known; pass dir.")
+    if _session is not None and not _session.closed and _session.dir == directory.resolve():
+        raise SessionError("Close the session before rendering the report.")
+    path, warnings = await asyncio.to_thread(report.render_report, directory, verdicts)
+    if not warnings:
+        return f"Report: {path}\nNo validation warnings."
+    return f"Report: {path}\nValidation warnings ({len(warnings)}):\n" + "\n".join(f"- {w}" for w in warnings)
 
 
 def main() -> None:
@@ -251,3 +212,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = ["CommandNotAllowed", "mcp", "main"]

@@ -1,69 +1,114 @@
 # mcp-qa-bot
 
-An MCP server (Python, FastMCP) that automates manual QA steps that need terminal
-commands plus a screenshot as proof of work.
+The execution layer for agent-driven manual QA on **dev or staging**.
 
-It exposes one tool, **`execute_and_screenshot`**, which:
+An MCP server (Python, FastMCP) that runs shell commands in a **tmux pane a human can
+watch and type in**, records everything that runs there, and renders a QA report from
+verdicts it is given. It knows nothing about QA. The workflow (understand, plan,
+danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manual-qa/SKILL.md).
 
-1. checks the command against an allowlist (default `kubectl`, `curl`, `psql`),
-2. brings iTerm2 to the foreground with AppleScript,
-3. optionally runs `clear`, then types the command into the **current iTerm2 session**,
-   which keeps kube context, env vars and open psql sessions,
-4. waits a configurable number of seconds for output,
-5. captures **only the iTerm2 window** with `screencapture -l <windowId>`,
-6. returns the PNG path, the visible terminal text and, optionally, the image inline.
+| | Execution tool (this server) | QA skill (`skills/manual-qa`) |
+|---|---|---|
+| Owns | tmux session, running commands, detecting when they finish, the session log, rendering the report, screenshots, hard safety limits | understanding the change, planning tests, danger review, approval gate, verdicts |
+| Guarantees | the log is complete and tamper-evident; report evidence is copied verbatim from the log; forbidden commands never run | the plan is approved before anything runs; every verdict cites log entries |
+
+## Tools
+
+| Tool | Does | Returns |
+|---|---|---|
+| `open_session(name, dir)` | Creates the session folder and tmux session (the user's own zsh), loads the hooks, starts recording | session id, `tmux attach` command, folder |
+| `exec(command, timeout?, screenshot?)` | Types the command into the pane exactly as written and waits for the hooks to signal it finished | entry id `#N`, exit code, duration, numbered output, screenshot path; or `TIMEOUT` / `BUSY` |
+| `peek(lines?)` | Shows the pane's recent contents | text + `idle` / `running` / `typing` |
+| `interrupt()` | Sends Ctrl-C | state |
+| `close_session(keep_tmux?)` | Stops recording, writes the exec index and the hashes | log path, entry count, sha256 |
+| `render_report(verdicts?, dir?)` | Checks integrity, validates verdicts against the closed log, renders `qa-report.md` | report path, validation warnings |
+
+## How it works
+
+- `open_session` starts `zsh -l` in a detached tmux session, so the user's `.zshrc`,
+  aliases and plugins load. It types one line, `source qa_bot/hooks.zsh …`, and waits
+  for the hooks' first `tmux wait-for` signal. Only then does `tmux pipe-pane` start
+  streaming the pane into `session.log`. No sleeps.
+- [`qa_bot/hooks.zsh`](qa_bot/hooks.zsh) wraps every command line, from the agent or a
+  human, in invisible OSC markers that travel through the pty with the output:
+  `ESC]777;qa;start;<id>;<epoch>;<command>BEL` … `ESC]777;qa;end;<id>;<exit>;<epoch>BEL`.
+  Ids come from a counter in the shell, so agent and human commands share one sequence.
+  `precmd` signals `tmux wait-for`, which is how `exec` knows a command finished.
+- `exec` pastes the command with bracketed paste, so `;` and multi-line heredocs
+  arrive exactly as written, then presses Enter. It returns `BUSY` without typing if a
+  command is running or the prompt line isn't empty (the human is typing).
+- `render_report` parses the log and classifies each marker pair against
+  `session.index.json`: 🤖 agent (matches an `exec` call), 👤 manual (top level, not in
+  the index), ⚠️ forged (inside another entry's output), ⚠️ missing (`exec` call with no
+  markers). Entry output is cleaned deterministically: escape sequences are stripped
+  and `\r` overwrites are replayed. Lines are numbered from 1 per entry.
+
+## Hard limits (enforced on every `exec`)
+
+- Every pipeline or chain segment must start with an allowlisted executable or alias.
+- Refused: `$(…)`, backticks, process substitution, output redirection (`2>&1` and
+  `>/dev/null` are fine), background jobs (`&`, `nohup`, `disown`), and multi-line input
+  other than `\` line continuations and a single heredoc.
+- Refused SQL, anywhere in the command: `TRUNCATE`, `DROP …`, and `DELETE`/`UPDATE`
+  without `WHERE`.
+- Production guard, checked before every `exec` because a human can switch context
+  mid-session. It refuses if the command, the pane's `KUBECONFIG` context, cluster or
+  server, or the pane's `PGHOST`, `PGDATABASE`, `PGSERVICE` or `DATABASE_URL` matches
+  `QA_BOT_PROD_PATTERN`.
+
+Commands the human types are not restricted. They are recorded and shown in the
+report as manual entries.
+
+## Session folder
+
+```
+<dir>/
+  qa-report.md          # rendered by render_report
+  verdicts.json         # written by the skill (or by render_report from its argument)
+  session.log           # raw tmux transcript, markers included
+  session.index.json    # exec calls: id, command, timestamp
+  session.log.sha256    # sha256 of log + index (`shasum -a 256 -c session.log.sha256`)
+  shots/                # optional screenshots (<id>.png, rendered with freeze)
+  inputs/               # test inputs (payloads, CSVs)
+```
 
 ## Requirements
 
-- macOS with iTerm2
-- Python ≥ 3.10 (Homebrew: `brew install python`)
-- Pinned to `mcp<2`: in the 2.x SDK, FastMCP was renamed to `MCPServer`.
+- macOS or Linux with **tmux ≥ 3.0** and **zsh ≥ 5.3**
+- Python ≥ 3.10; pinned to `mcp<2` (FastMCP was renamed in the 2.x SDK)
+- Optional: [`freeze`](https://github.com/charmbracelet/freeze) for screenshots
+  (`brew install charmbracelet/tap/freeze`)
+
+No macOS Automation or Screen Recording permissions are needed.
 
 ## Setup
 
 ```bash
 /opt/homebrew/bin/python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest          # allowlist unit tests
+.venv/bin/python -m pytest   # unit tests + a tmux/zsh integration test on a private socket
 ```
-
-### macOS permissions (first run)
-
-- **Automation**: allow the host app (Claude Desktop, Terminal, …) to control iTerm2.
-- **Screen Recording**: System Settings → Privacy & Security → Screen Recording, enable
-  the host app. Without it, screenshots show only the desktop wallpaper.
 
 ## Configuration
 
-| Env var                   | Default             | Meaning                                    |
-|---------------------------|---------------------|--------------------------------------------|
-| `QA_BOT_ALLOWED_COMMANDS` | `kubectl,curl,psql` | Comma-separated allowed executables        |
-| `QA_BOT_SCREENSHOT_DIR`   | `~/qa-screenshots`  | Where PNGs are written                     |
-| `QA_BOT_DEFAULT_WAIT`     | `3`                 | Seconds to wait before capturing (max 300) |
+| Env var                   | Default | Meaning |
+|---------------------------|---------|---------|
+| `QA_BOT_ALLOWED_COMMANDS` | `kubectl,curl,psql,jq,grep,head,tail,wc,sort,uniq,echo,sleep,date` | Executables/aliases `exec` may run |
+| `QA_BOT_PROD_PATTERN`     | `(?<![a-z0-9])(prod\|production\|prd)(?![a-z])` | Case-insensitive regex for production names |
+| `QA_BOT_DEFAULT_TIMEOUT`  | `60`    | Seconds `exec` waits for a command (max 1800) |
+| `QA_BOT_EXEC_MAX_LINES`   | `300`   | Trailing output lines `exec` returns to the agent |
+| `QA_BOT_REPORT_MAX_LINES` | `200`   | Lines shown when an entry is cited without a line range (a warning asks for a range) |
+| `QA_BOT_TMUX_SOCKET`      | –       | tmux socket name (`-L`); default is the user's normal tmux server |
 
-Allowlist rules: pipes and `&&`/`;` chains are allowed if **every** segment starts with
-an allowed executable, so for `kubectl get pods | grep Running` add `grep` to the list.
-Command substitution (`$(…)`, backticks), output redirection (`>`) and multi-line
-commands are always rejected.
-
-## Tool parameters
-
-| Param           | Default  | Notes                                                   |
-|-----------------|----------|---------------------------------------------------------|
-| `command`       | required | Command to run                                          |
-| `wait_seconds`  | env/3    | Increase for slow commands                              |
-| `label`         | –        | Used in the filename, e.g. `pods-ready`                 |
-| `clear_screen`  | `true`   | Set `false` when inside an interactive prompt like psql |
-| `include_image` | `false`  | Also return the PNG inline to the LLM                   |
-| `output_lines`  | `60`     | Trailing lines of terminal text to return               |
-
-## Running / testing
-
-Standalone (stdio):
+## Claude Code integration
 
 ```bash
-.venv/bin/python qa_server.py
+claude mcp add qa-bot -- /path/to/mcp-qa-bot/.venv/bin/python /path/to/mcp-qa-bot/qa_server.py
+ln -s /path/to/mcp-qa-bot/skills/manual-qa ~/.claude/skills/manual-qa
 ```
+
+Then ask Claude to "QA PAY-123 on staging" and attach to the session it opens with the
+`tmux attach -t …` command it prints.
 
 MCP Inspector:
 
@@ -71,32 +116,7 @@ MCP Inspector:
 npx @modelcontextprotocol/inspector .venv/bin/python qa_server.py
 ```
 
-## Claude Desktop / Claude Code integration
+## Not in scope yet
 
-`~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "qa-bot": {
-      "command": "/Users/gonzalo.abella/github/abellagonzalo/mcp-qa-bot/.venv/bin/python",
-      "args": ["/Users/gonzalo.abella/github/abellagonzalo/mcp-qa-bot/qa_server.py"],
-      "env": {
-        "QA_BOT_ALLOWED_COMMANDS": "kubectl,curl,psql,grep,jq",
-        "QA_BOT_SCREENSHOT_DIR": "/Users/gonzalo.abella/qa-screenshots"
-      }
-    }
-  }
-}
-```
-
-Claude Code:
-
-```bash
-claude mcp add qa-bot -- /Users/gonzalo.abella/github/abellagonzalo/mcp-qa-bot/.venv/bin/python \
-  /Users/gonzalo.abella/github/abellagonzalo/mcp-qa-bot/qa_server.py
-```
-
-> ⚠️ The tool types into the *active* iTerm2 session. Don't run it from a Claude Code
-> session that is itself running in iTerm2's active tab, or the command will be typed
-> into Claude Code's prompt. Keep a separate iTerm2 window focused for QA.
+- Hiding secrets in logs and reports.
+- Browser-driven testing.

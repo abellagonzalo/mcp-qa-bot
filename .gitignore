@@ -1,5 +1,11 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
 .pytest_cache/
-qa-screenshots/
+
+# QA session output from local runs (session logs, reports, screenshots, inputs)
+qa/
+
+# macOS
+.DS_Store
