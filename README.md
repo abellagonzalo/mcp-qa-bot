@@ -53,7 +53,9 @@ danger review, approval, verdicts) lives in the [`manual-qa` skill](skills/manua
   the index), ⚠️ forged (inside another entry's output), ⚠️ missing (`exec` call with no
   markers). Entry output is cleaned deterministically: escape sequences are stripped
   and `\r` overwrites are replayed. Lines are numbered from 1 per entry.
-- The report has a summary table, then one section per test with its cited evidence.
+- The report has a summary table, a linked table of contents (each test and its evidence
+  blocks, named by each evidence item's `title`), then one section per test with its
+  cited evidence.
   There is no timeline of every entry. Anything wrong with the log instead becomes a
   warning, shown in a `[!WARNING]` box at the top and returned by `render_report`:
   each forged or stray marker, each `exec` call with no markers, each flagged entry

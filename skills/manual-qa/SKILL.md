@@ -340,7 +340,11 @@ for long output.
     "expected": "1st POST `201`, 2nd POST `409`, one row in `transfers`",
     "verdict": "fail",
     "actual": "2nd POST returned `201`; two rows created",
-    "evidence": [2, {"entry": 4, "lines": "1-3"}, 5],
+    "evidence": [
+      {"entry": 2, "title": "1st POST is accepted with 201"},
+      {"entry": 4, "lines": "1-3", "title": "2nd POST with the same key also returns 201"},
+      {"entry": 5, "title": "transfers has two rows for the key"}
+    ],
     "note": "`IdempotencyFilter` is not registered on `/v1/transfers` (`TransferController.kt:42`)"
   }]
 }
@@ -352,8 +356,11 @@ for long output.
   `status=CANCELLED`); use **bold** sparingly for the deciding fact. Keep each on one
   line: no lists, headings or code fences.
 - `evidence` items are an entry id (whole entry) or `{"entry": id, "lines": "a-b"}`.
-  For a poll, cite `{"poll": 1}` or any attempt's entry id: the report shows the group
-  as one block. Cite `{"entry": id, "lines": "a-b"}` to show only that attempt.
+  Give each one a `title`: what it shows, in plain words ("Cancel returns 200 with
+  status CANCELLED"), not the command. It names the block's heading and its link in the
+  report's contents; without one the link reads "Evidence 1".
+  For a poll, cite `{"poll": 1, "title": "…"}` or any attempt's entry id: the report
+  shows the group as one block. Cite `{"entry": id, "lines": "a-b"}` to show only that attempt.
 - A failure states actual vs expected. It may point to a bug in the code or in the
   ticket; say which you think it is in `note`.
 - Judge from the text output `exec` returns.

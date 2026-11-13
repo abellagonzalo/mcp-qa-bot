@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -44,6 +44,7 @@ class Citation:
 
     entry: transcript.Entry
     lines: tuple[int, int] | None  # 1-based inclusive range, None = whole entry
+    title: str = ""  # what the evidence shows, in words; links and headings use it
 
 
     @property
@@ -57,6 +58,7 @@ class PollCitation:
 
     group: PollGroup
     entries: tuple[transcript.Entry, ...]  # attempts found in the log, in order
+    title: str = ""
 
     @property
     def entry_ids(self) -> list[int]:
@@ -151,6 +153,24 @@ def _parse_citation(
     test_id: str,
     warnings: list[str],
 ) -> Citation | PollCitation | MissingCitation | None:
+    """An evidence item, resolved against the log; a dict item may add a ``title``."""
+    title = ""
+    if isinstance(item, dict) and "title" in item:
+        title = _text(item["title"])
+        item = {k: v for k, v in item.items() if k != "title"}
+    c = _resolve_citation(item, rec, missing_ids, test_id, warnings)
+    if title and isinstance(c, (Citation, PollCitation)):
+        c = replace(c, title=title)
+    return c
+
+
+def _resolve_citation(
+    item,
+    rec: Record,
+    missing_ids: set[int],
+    test_id: str,
+    warnings: list[str],
+) -> Citation | PollCitation | MissingCitation | None:
     by_id = rec.by_id()
     polls = rec.polls
     if isinstance(item, dict) and set(item) == {"poll"} and _is_int(item["poll"]):
@@ -166,7 +186,7 @@ def _parse_citation(
     else:
         warnings.append(
             f"{test_id}: evidence item {json.dumps(item)} is not an entry id, "
-            f"{{\"entry\": id, \"lines\": \"a-b\"}} or {{\"poll\": n}}."
+            f"{{\"entry\": id, \"lines\": \"a-b\", \"title\": \"…\"}} or {{\"poll\": n, \"title\": \"…\"}}."
         )
         return None
 
@@ -391,10 +411,56 @@ def _alt(c: Citation | PollCitation) -> str:
     return f"#{c.entry.id}" + (f" lines {c.lines[0]}-{c.lines[1]}" if c.lines else "")
 
 
-def _evidence_block(c: Citation | PollCitation, blocks: evidence.Renderer, test_id: str, k: int) -> list[str]:
+class _Anchors:
+    """Unique HTML anchor ids per test (``t1``, ``t1-2`` …), so links don't depend on
+    how a viewer slugs headings (GitHub, IDEs and Confluence all differ)."""
+
+    def __init__(self):
+        self._used: set[str] = set()
+        self._by_test: dict[int, str] = {}
+
+    def test(self, index: int, test_id: str) -> str:
+        if index not in self._by_test:
+            base = re.sub(r"[^a-z0-9_-]+", "-", test_id.lower()).strip("-") or "test"
+            name, n = base, 1
+            while name in self._used:
+                n += 1
+                name = f"{base}_{n}"
+            self._used.add(name)
+            self._by_test[index] = name
+        return self._by_test[index]
+
+
+def _link_text(text: str) -> str:
+    """Plain text safe inside ``[...]``: markdown punctuation is backslash-escaped."""
+    return re.sub(r"([\\`*_\[\]<>|~])", r"\\\1", text)
+
+
+def _evidence_label(c: Citation | PollCitation, k: int) -> str:
+    """Contents line for one evidence block: its title, or ``Evidence k`` without one."""
+    return c.title or f"Evidence {k}"
+
+
+def _contents(tests, anchors: _Anchors) -> list[str]:
+    out = ["## Contents", ""]
+    for i, test in enumerate(tests):
+        a = anchors.test(i, test.id)
+        icon = VERDICT_ICONS.get(test.verdict, "❔ " + test.verdict)
+        out.append(f"- [{_link_text(f'{test.id}: {test.goal}')}](#{a}) {icon}")
+        for k, c in enumerate(test.evidence, 1):
+            out.append(f"  - [{_link_text(_evidence_label(c, k))}](#{a}-{k})")
+    out.append("")
+    return out
+
+
+def _evidence_block(
+    c: Citation | PollCitation, blocks: evidence.Renderer, test_id: str, k: int, anchor: str
+) -> list[str]:
     """One evidence block: heading and flags, then the cited lines as ``blocks`` renders them."""
     head, body = _evidence_body(c)
-    out = [f"### {' · '.join(head)}"]
+    meta = " · ".join(head)
+    out = [f'<a id="{anchor}"></a>', ""]
+    out += [f"### {c.title}", f"{meta}  "] if c.title else [f"### {meta}"]
     out += [f"> ⚠️ {flag}" for flag in _flags(c)]
     out += blocks.block(test_id, k, _alt(c), body)
     out.append("")
@@ -410,10 +476,12 @@ def render(
     blocks = blocks or evidence.Renderer()
     model = parse_verdicts(verdicts, rec)
 
+    anchors = _Anchors()
     sections: list[str] = []
-    for test in model.tests:
+    for i, test in enumerate(model.tests):
         cits = test.evidence
-        sections.append(f"## {test.id}: {test.goal}")
+        a = anchors.test(i, test.id)
+        sections += [f'<a id="{a}"></a>', "", f"## {test.id}: {test.goal}"]
         fields = [
             ("Input", test.input),
             ("Expected", test.expected),
@@ -434,7 +502,7 @@ def render(
                 sections.append(f"👤 Manual entries during this test: {listed}  ")
         sections.append("")
         for k, c in enumerate(cits, 1):
-            sections += _evidence_block(c, blocks, test.id, k)
+            sections += _evidence_block(c, blocks, test.id, k, f"{a}-{k}")
 
     warnings = model.warnings + blocks.warnings + log_anomalies(rec, model.tests)
 
@@ -455,6 +523,8 @@ def render(
         goal = test.goal.replace("|", "\\|")
         out.append(f"| {test.id} | {goal} | {icon} |")
     out.append("")
+    if model.tests:
+        out += _contents(model.tests, anchors)
     out += sections
 
     out += [
